@@ -5,6 +5,7 @@ End-to-end retail analytics and ML platform built on **Databricks** with **PySpa
 > 🚧 Work in progress. Results below are filled in only from real runs.
 
 ## What it does (planned)
+
 1. **Medallion pipeline**: Bronze → Silver → Gold Delta tables with data-quality checks
 2. **Pipeline optimisation**: measured before/after (liquid clustering, broadcast joins, incremental MERGE)
 3. **Customer segmentation**: RFM + behavioural features, KMeans / BisectingKMeans / GMM
@@ -14,6 +15,7 @@ End-to-end retail analytics and ML platform built on **Databricks** with **PySpa
 7. **Analytics**: Databricks AI/BI dashboard with business insights
 
 ## Repository layout
+
 ```
 src/            reusable PySpark modules (ingestion, transformations, features, ...)
 notebooks/      one explanatory notebook per phase (imports from src/)
@@ -25,6 +27,7 @@ resources/      job/pipeline definitions for the Asset Bundle
 ```
 
 ## Local setup (macOS)
+
 ```bash
 brew install python@3.12 openjdk@17
 python3.12 -m venv .venv && source .venv/bin/activate
@@ -33,10 +36,9 @@ ruff check . && pytest
 ```
 
 ## Results
+
 _To be added with real numbers after each phase._
 
 ## Dataset
-Chen, D. (2012). *Online Retail II* [Dataset]. UCI Machine Learning Repository. https://doi.org/10.24432/C5CG6D
 
-
-This is a test
+Chen, D. (2012). _Online Retail II_ [Dataset]. UCI Machine Learning Repository. https://doi.org/10.24432/C5CG6D
