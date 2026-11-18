@@ -1,0 +1,15 @@
+# Local development only. On Databricks, serverless already provides PySpark/Delta/MLflow.
+#
+# PySpark is pinned to the 4.0 line for local unit tests (needs Java 17 or 21).
+# After the Phase 0 smoke test prints `spark.version` on serverless, align this pin
+# with it and record both in PROGRESS_LOG.md -> Conventions.
+pyspark>=4.0,<4.1
+
+# Testing & linting
+pytest>=8.3
+ruff>=0.8
+
+# Data prep (Phase 0 xlsx -> csv conversion script)
+pandas>=2.2
+openpyxl>=3.1
+pyarrow>=17

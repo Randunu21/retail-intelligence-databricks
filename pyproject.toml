@@ -1,0 +1,52 @@
+[project]
+name = "retail-intelligence-databricks"
+version = "0.1.0"
+description = "Retail Customer & Product Intelligence Platform on Databricks (PySpark, Delta, MLflow)"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"   # matches Databricks serverless environment Python 3.12
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = [".venv", "data"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort (import order)
+    "B",   # flake8-bugbear (likely bugs)
+    "UP",  # pyupgrade (modern syntax)
+    "SIM", # simplifications
+]
+ignore = ["E501"]  # long lines are handled by the formatter
+
+[tool.ruff.lint.per-file-ignores]
+# Databricks notebooks (.py source format): `spark`, `dbutils`, `display` are injected
+# globals, and imports come after the sys.path bootstrap cell.
+"notebooks/**/*.py" = ["F821", "E402", "I001"]
+"tests/**/*.py" = ["B011"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "ingestion", "transformations", "features",
+    "segmentation", "modeling", "scoring", "monitoring",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]          # lets tests do `from transformations.silver import ...`
+addopts = "-ra -q"
+markers = [
+    "spark: tests that start a local SparkSession (need Java 17)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:pyspark.*",
+]

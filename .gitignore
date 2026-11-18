@@ -1,0 +1,50 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Tooling caches ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Local Spark artefacts (from local pytest runs) ---
+spark-warehouse/
+metastore_db/
+derby.log
+*.crc
+
+# --- Raw / converted data: never commit (lives in the UC Volume) ---
+data/
+*.xlsx
+*.csv
+*.parquet
+!tests/fixtures/*.csv
+
+# --- Databricks local config & bundle state ---
+.databricks/
+.databrickscfg
+
+# --- Secrets ---
+.env
+*.pem
+
+# --- Editors / OS ---
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+.DS_Store
+
+# --- Jupyter ---
+.ipynb_checkpoints/
