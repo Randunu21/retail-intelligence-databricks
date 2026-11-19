@@ -633,3 +633,64 @@ display(
 # COMMAND ----------
 
 display(daily.orderBy(F.desc("revenue")).limit(5))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6. Phase 1 summary (for `PROGRESS_LOG.md`)
+# MAGIC Prints every number the Phase 1 handover needs as Markdown, straight from the tables,
+# MAGIC so nothing is typed by hand. Copy the printed output into the handover.
+
+# COMMAND ----------
+
+all_tables = [
+    BRONZE_TRANSACTIONS,
+    SILVER_SALES,
+    SILVER_RETURNS,
+    SILVER_DQ_LOG,
+    GOLD_FACT_SALES,
+    GOLD_DIM_DATE,
+    GOLD_DIM_PRODUCT,
+    GOLD_DIM_CUSTOMER,
+    GOLD_DAILY_SALES,
+    GOLD_MONTHLY_COUNTRY_SALES,
+    GOLD_PRODUCT_PERFORMANCE,
+    GOLD_CUSTOMER_COHORT_RETENTION,
+]
+lines = ["### Row counts", "| Table | Rows |", "|---|---:|"]
+lines += [f"| `{t}` | {spark.table(t).count():,} |" for t in all_tables]
+
+lines += [
+    "",
+    f"### Data-quality results (pipeline run {latest_run})",
+    "| Dataset | Rule | Action | Failed records | Failed % |",
+    "|---|---|---|---:|---:|",
+]
+for r in latest.orderBy("dataset", F.desc("action"), F.desc("failed_records")).collect():
+    lines.append(
+        f"| {r['dataset']} | `{r['rule']}` | {r['action']} | {r['failed_records']:,} | {r['failed_pct']} |"
+    )
+
+lines += ["", "### Rows in → rows out", "| Step | Rows |", "|---|---:|"]
+lines += [f"| {r['step']} | {r['rows']:,} |" for r in flow_summary.collect()]
+
+kpi = fact.agg(
+    F.sum("line_revenue").alias("revenue"),
+    F.countDistinct("invoice").alias("invoices"),
+    F.min("invoice_ts").alias("first_sale"),
+    F.max("invoice_ts").alias("last_sale"),
+    F.countDistinct("country").alias("countries"),
+).collect()[0]
+returns_value = returns.agg(F.sum("line_revenue")).collect()[0][0]
+lines += [
+    "",
+    "### Key figures",
+    f"- Sales revenue: {kpi['revenue']:,} | returns value: {returns_value:,}",
+    f"- Invoices: {kpi['invoices']:,} | countries: {kpi['countries']}",
+    f"- Sales period: {kpi['first_sale']} → {kpi['last_sale']}",
+    f"- Known customers: {known_customers:,} | sales lines without customer: "
+    f"{fact.filter('customer_key = -1').count():,}",
+    f"- Products: {dim_product.count():,} | with >1 description: "
+    f"{dim_product.filter('n_description_variants > 1').count():,}",
+]
+print("\n".join(lines))
