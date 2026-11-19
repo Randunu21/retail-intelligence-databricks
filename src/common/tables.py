@@ -49,3 +49,8 @@ def bench_table(prefix: str, logical_name: str) -> str:
     """Benchmark copy of a table, e.g. bench_table("x1_baseline", "silver_sales")
     -> retail.bench.x1_baseline__silver_sales (double underscore separates the two parts)."""
     return fq(BENCH_SCHEMA, f"{prefix}__{logical_name}")
+
+
+def bench_bronze(factor: int) -> str:
+    """Synthetic scaled-up Bronze copy, e.g. retail.bench.bronze_x10 (see optimisation.scaling)."""
+    return fq(BENCH_SCHEMA, f"bronze_x{factor}")

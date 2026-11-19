@@ -9,7 +9,9 @@ from optimisation.benchmark import (
     Variant,
     WriteSpec,
     compare,
+    compare_scales,
     fingerprint,
+    latest_run_id,
     markdown_table,
     parse_detail,
     pct_change,
@@ -172,3 +174,26 @@ def test_markdown_table():
         "|---|---|---|",
         "| silver_sales | 1.5 |  |",
     ]
+
+
+def test_latest_run_id_prefers_full_then_recent(spark):
+    def rec(run, step, day):
+        r = _record("baseline", step, 1, 2, 1.0)
+        return {**r, "run_id": run, "started_at": datetime(2026, 11, day, tzinfo=UTC)}
+
+    runs = records_to_df(
+        spark,
+        [rec("old_full", "a", 19), rec("old_full", "b", 19), rec("new_partial", "a", 20)],
+    )
+    assert latest_run_id(runs, "baseline", "x1") == "old_full"
+    assert latest_run_id(runs, "baseline", "x10") is None
+
+
+def test_compare_scales_ratios(spark):
+    recs = []
+    for scale, secs, rows in (("x1", 2.0, 100), ("x10", 9.0, 1000)):
+        r = {**_record("baseline", "silver_sales", 1, 2, secs), "scale": scale, "output_rows": rows}
+        recs.append(r)
+    out = compare_scales(summarise(records_to_df(spark, recs)), "x1", "x10").first()
+    assert (out.time_ratio, out.rows_ratio) == (4.5, 10.0)
+    assert out.median_s_x1 == 2.0 and out.median_s_x10 == 9.0

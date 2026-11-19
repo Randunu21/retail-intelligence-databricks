@@ -238,6 +238,42 @@ def compare(summary: DataFrame, before: str, after: str) -> DataFrame:
     )
 
 
+def latest_run_id(runs: DataFrame, experiment: str, scale: str) -> str | None:
+    """run_id of the most recent run of (experiment, scale) that covered the most steps.
+
+    Lets the notebook reuse a recorded baseline instead of re-timing it on every visit.
+    Runs that only re-timed a few steps (`only_steps`) lose to a full run.
+    """
+    row = (
+        runs.filter((F.col("experiment") == experiment) & (F.col("scale") == scale))
+        .groupBy("run_id")
+        .agg(F.countDistinct("step").alias("steps"), F.max("started_at").alias("last"))
+        .orderBy(F.desc("steps"), F.desc("last"))
+        .first()
+    )
+    return row.run_id if row else None
+
+
+def compare_scales(summary: DataFrame, small: str, large: str) -> DataFrame:
+    """Same experiment at two scales: medians side by side and how much each step grew."""
+    cols = ["experiment", "step", "step_order", "median_s", "output_rows", "num_files", "size_mb"]
+    a = summary.filter(F.col("scale") == small).select(*cols)
+    b = summary.filter(F.col("scale") == large).select(*cols)
+    for c in cols[3:]:
+        a = a.withColumnRenamed(c, f"{c}_{small}")
+        b = b.withColumnRenamed(c, f"{c}_{large}")
+    return (
+        a.join(b.drop("step_order"), ["experiment", "step"])
+        .withColumn(
+            "time_ratio", F.round(F.col(f"median_s_{large}") / F.col(f"median_s_{small}"), 2)
+        )
+        .withColumn(
+            "rows_ratio", F.round(F.col(f"output_rows_{large}") / F.col(f"output_rows_{small}"), 2)
+        )
+        .orderBy("experiment", "step_order")
+    )
+
+
 def fingerprint(df: DataFrame) -> DataFrame:
     """Row count + an order-independent checksum of every value in `df`.
 
