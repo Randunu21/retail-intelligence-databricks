@@ -29,11 +29,13 @@ ignore = ["E501"]  # long lines are handled by the formatter
 # globals, and imports come after the sys.path bootstrap cell.
 "notebooks/**/*.py" = ["F821", "E402", "I001"]
 "tests/**/*.py" = ["B011"]
+# Lakeflow pipeline sources: `spark` is injected, imports follow the sys.path bootstrap.
+"pipelines/**/*.py" = ["F821", "E402", "I001"]
 
 [tool.ruff.lint.isort]
 known-first-party = [
     "ingestion", "transformations", "features",
-    "segmentation", "modeling", "scoring", "monitoring",
+    "segmentation", "modeling", "scoring", "monitoring", "common",
 ]
 
 [tool.ruff.format]
