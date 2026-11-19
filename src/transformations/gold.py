@@ -122,3 +122,69 @@ def build_dim_customer(sales: DataFrame) -> DataFrame:
         F.lit(True).alias("is_unknown"),
     )
     return customers.unionByName(unknown)
+
+
+# ----------------------------------------------------------------------------------------
+# Customer cohort retention (Phase 1.5)
+# ----------------------------------------------------------------------------------------
+COHORT_RETENTION_COLUMNS: list[str] = [
+    "cohort_month",
+    "months_since_first_purchase",
+    "activity_month",
+    "cohort_size",
+    "active_customers",
+    "retention_rate",
+    "revenue",
+]
+
+
+def build_customer_cohort_retention(fact_sales: DataFrame, dim_customer: DataFrame) -> DataFrame:
+    """Cohort retention grid: first-purchase month x months since first purchase.
+
+    - Cohort = all known customers whose FIRST purchase was in that month
+      (`dim_customer.cohort_month`). The Unknown customer (-1) is excluded.
+    - A customer is "active" in a month if they have at least one sales line that month.
+    - retention_rate = active customers / cohort size (month 0 is always 1.0).
+    - The grid is COMPLETE: every cohort gets a row for every month from 0 up to the last
+      month in the data, with 0 active customers where nobody came back. Without this,
+      missing cells would look like "no data" instead of "0 % retained" on a heatmap.
+    """
+    cohorts = dim_customer.filter(~F.col("is_unknown")).select("customer_key", "cohort_month")
+    activity = (
+        fact_sales.filter(F.col("customer_key") != UNKNOWN_CUSTOMER_KEY)
+        .withColumn("activity_month", F.trunc(F.to_date("invoice_ts"), "month"))
+        .groupBy("customer_key", "activity_month")
+        .agg(F.sum("line_revenue").alias("revenue"))
+        .join(cohorts, "customer_key")
+        .withColumn(
+            "months_since_first_purchase",
+            F.months_between("activity_month", "cohort_month").cast("int"),
+        )
+    )
+    active = activity.groupBy("cohort_month", "months_since_first_purchase").agg(
+        F.countDistinct("customer_key").alias("active_customers"),
+        F.sum("revenue").alias("revenue"),
+    )
+    sizes = cohorts.groupBy("cohort_month").agg(F.count(F.lit(1)).alias("cohort_size"))
+    last_month = activity.agg(F.max("activity_month").alias("last_month"))
+    grid = (
+        sizes.crossJoin(last_month)
+        .withColumn(
+            "months_since_first_purchase",
+            F.explode(
+                F.sequence(F.lit(0), F.months_between("last_month", "cohort_month").cast("int"))
+            ),
+        )
+        .drop("last_month")
+    )
+    return (
+        grid.join(active, ["cohort_month", "months_since_first_purchase"], "left")
+        .withColumn(
+            "activity_month",
+            F.add_months("cohort_month", F.col("months_since_first_purchase")),
+        )
+        .withColumn("active_customers", F.coalesce("active_customers", F.lit(0)).cast("bigint"))
+        .withColumn("revenue", F.coalesce("revenue", F.lit(0).cast("decimal(28,3)")))
+        .withColumn("retention_rate", F.round(F.col("active_customers") / F.col("cohort_size"), 4))
+        .select(*COHORT_RETENTION_COLUMNS)
+    )

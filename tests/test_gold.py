@@ -1,17 +1,15 @@
 """Tests for the Gold star schema: DataFrame-API dimensions and the pipeline SQL files.
 
-The SQL files are tested too: `pipeline_select()` takes the query part of a pipeline .sql
-file (everything after the line that is just "AS"), points it at a local temp view instead
-of retail.silver.sales, and runs it on the local SparkSession.
+The SQL files are tested too, via `factories.run_pipeline_query` (query part of the
+pipeline .sql file, run against local temp views).
 """
 
-import re
 from datetime import date, datetime
 from decimal import Decimal
-from pathlib import Path
 
 import pytest
 
+from factories import SILVER_SCHEMA, run_pipeline_query, sale
 from transformations.gold import (
     DIM_CUSTOMER_COLUMNS,
     DIM_PRODUCT_COLUMNS,
@@ -22,44 +20,6 @@ from transformations.gold import (
 from transformations.silver import SILVER_OUTPUT_COLUMNS
 
 pytestmark = pytest.mark.spark
-
-PIPELINE_DIR = Path(__file__).resolve().parents[1] / "pipelines" / "medallion" / "transformations"
-
-SILVER_SCHEMA = (
-    "invoice STRING, stock_code STRING, description STRING, quantity INT, "
-    "price DECIMAL(10,3), line_revenue DECIMAL(18,3), invoice_ts TIMESTAMP_NTZ, "
-    "invoice_date DATE, customer_id INT, is_missing_customer BOOLEAN, country STRING, "
-    "_source_file STRING, _ingested_at TIMESTAMP"
-)
-
-
-def sale(
-    invoice,
-    code,
-    desc="PRODUCT",
-    qty=1,
-    price="1.00",
-    ts="2010-12-01 08:00",
-    cust=100,
-    country="United Kingdom",
-):
-    t = datetime.strptime(ts, "%Y-%m-%d %H:%M")
-    p = Decimal(price)
-    return (
-        invoice,
-        code,
-        desc,
-        qty,
-        p,
-        (qty * p).quantize(Decimal("0.001")),
-        t,
-        t.date(),
-        cust,
-        cust is None,
-        country,
-        "f.csv",
-        datetime(2026, 11, 19),
-    )
 
 
 @pytest.fixture
@@ -75,10 +35,7 @@ def make_sales(spark):
 @pytest.fixture
 def pipeline_select(spark):
     def _run(sql_file, sales_df):
-        text = (PIPELINE_DIR / sql_file).read_text()
-        query = re.split(r"(?im)^\s*AS\s*$", text, maxsplit=1)[1]
-        sales_df.createOrReplaceTempView("silver_sales_test")
-        return spark.sql(query.replace("retail.silver.sales", "silver_sales_test"))
+        return run_pipeline_query(spark, sql_file, {"retail.silver.sales": sales_df})
 
     return _run
 

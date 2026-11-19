@@ -38,10 +38,14 @@ from pyspark.sql import functions as F
 
 from common.tables import (
     BRONZE_TRANSACTIONS,
+    GOLD_CUSTOMER_COHORT_RETENTION,
+    GOLD_DAILY_SALES,
     GOLD_DIM_CUSTOMER,
     GOLD_DIM_DATE,
     GOLD_DIM_PRODUCT,
     GOLD_FACT_SALES,
+    GOLD_MONTHLY_COUNTRY_SALES,
+    GOLD_PRODUCT_PERFORMANCE,
     PIPELINE_EVENT_LOG,
     RAW_MANIFEST_PATH,
     SILVER_DQ_LOG,
@@ -498,3 +502,134 @@ display(
     .agg(F.sum("line_revenue").alias("revenue"), F.countDistinct("invoice").alias("invoices"))
     .orderBy("year_month", "is_unknown")
 )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5. Gold: aggregates and cohort retention
+# MAGIC
+# MAGIC | Table | Built with | Grain | Why this tool |
+# MAGIC |---|---|---|---|
+# MAGIC | `daily_sales` | **Spark SQL** | one row per calendar day | `dim_date LEFT JOIN fact_sales` + GROUP BY: classic SQL |
+# MAGIC | `monthly_country_sales` | **Spark SQL** | year_month × country | GROUP BY + a window for share of month |
+# MAGIC | `product_performance` | **Spark SQL** | one row per product | CTEs (sold / returned) + ranking windows |
+# MAGIC | `customer_cohort_retention` | **DataFrame API** | first-purchase month × months since | needs a generated complete grid (explode a month sequence) → tested Python |
+# MAGIC
+# MAGIC **Whole Gold layer:** SQL = `fact_sales`, `dim_date`, `daily_sales`, `monthly_country_sales`,
+# MAGIC `product_performance`; DataFrame API = `dim_product`, `dim_customer`,
+# MAGIC `customer_cohort_retention`.
+# MAGIC
+# MAGIC **Design notes**
+# MAGIC - `daily_sales` starts from `dim_date`, so days without sales appear with revenue 0.
+# MAGIC - "customers" counts only known customers (the Unknown member `-1` is not a person).
+# MAGIC - `product_performance.return_rate` = units returned / units sold (from `silver.returns`).
+# MAGIC   It can exceed 1 when returns relate to sales before Dec 2009 (outside the data).
+# MAGIC - **Cohort retention:** cohort = month of a customer's first purchase. Retention in month
+# MAGIC   *n* = share of the cohort that bought again *n* months later. The grid is complete
+# MAGIC   (0 where nobody returned). Caveat: the data starts in Dec 2009, so the **2009-12 cohort
+# MAGIC   also contains older customers** whose real first purchase is earlier (left-censoring);
+# MAGIC   its retention looks better than a true new-customer cohort.
+
+# COMMAND ----------
+
+daily = spark.table(GOLD_DAILY_SALES)
+monthly_country = spark.table(GOLD_MONTHLY_COUNTRY_SALES)
+product_perf = spark.table(GOLD_PRODUCT_PERFORMANCE)
+cohort = spark.table(GOLD_CUSTOMER_COHORT_RETENTION)
+
+display(
+    spark.createDataFrame(
+        [
+            (GOLD_DAILY_SALES, daily.count()),
+            (GOLD_MONTHLY_COUNTRY_SALES, monthly_country.count()),
+            (GOLD_PRODUCT_PERFORMANCE, product_perf.count()),
+            (GOLD_CUSTOMER_COHORT_RETENTION, cohort.count()),
+        ],
+        "table STRING, rows BIGINT",
+    )
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5a. Consistency checks
+# MAGIC Every aggregate must add back up to the fact table.
+
+# COMMAND ----------
+
+fact_revenue = fact.agg(F.sum("line_revenue")).collect()[0][0]
+known_customers = dim_customer.filter(~F.col("is_unknown")).count()
+agg_checks = {
+    "daily_rows_minus_dim_date_rows": daily.count() - dim_date.count(),
+    "daily_revenue_minus_fact": daily.agg(F.sum("revenue")).collect()[0][0] - fact_revenue,
+    "monthly_country_revenue_minus_fact": monthly_country.agg(F.sum("revenue")).collect()[0][0]
+    - fact_revenue,
+    "duplicate_month_country_rows": monthly_country.count()
+    - monthly_country.select("year_month", "country").distinct().count(),
+    "product_rows_minus_dim_product_rows": product_perf.count() - dim_product.count(),
+    "product_revenue_minus_fact": product_perf.agg(F.sum("revenue")).collect()[0][0] - fact_revenue,
+    "cohort_size_sum_minus_known_customers": cohort.filter("months_since_first_purchase = 0")
+    .agg(F.sum("cohort_size"))
+    .collect()[0][0]
+    - known_customers,
+    "month0_rows_not_fully_retained": cohort.filter(
+        "months_since_first_purchase = 0 AND retention_rate <> 1"
+    ).count(),
+}
+print(agg_checks)
+assert all(v == 0 for v in agg_checks.values()), agg_checks
+print("✅ Gold aggregates reconcile with fact_sales")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5b. Cohort retention heatmap (first 12 months)
+# MAGIC Rows = cohort (first-purchase month), columns = months since first purchase, values =
+# MAGIC retention rate. Tip: in the result table, use **+ → Visualization → Heatmap**, or keep it
+# MAGIC as a table. (The Phase 8 dashboard will show this properly.)
+
+# COMMAND ----------
+
+display(
+    cohort.filter("months_since_first_purchase <= 12")
+    .groupBy(F.date_format("cohort_month", "yyyy-MM").alias("cohort"), "cohort_size")
+    .pivot("months_since_first_purchase", list(range(13)))
+    .agg(F.first("retention_rate"))
+    .orderBy("cohort")
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5c. Quick look: top products, top countries, busiest days
+
+# COMMAND ----------
+
+display(
+    product_perf.orderBy("revenue_rank")
+    .select(
+        "revenue_rank",
+        "stock_code",
+        "description",
+        "revenue",
+        "units_sold",
+        "customers",
+        "return_rate",
+        "revenue_share_pct",
+    )
+    .limit(10)
+)
+
+# COMMAND ----------
+
+display(
+    monthly_country.groupBy("country")
+    .agg(F.sum("revenue").alias("revenue"), F.sum("invoices").alias("invoices"))
+    .withColumn("revenue_share_pct", F.round(F.col("revenue") * 100 / F.lit(fact_revenue), 2))
+    .orderBy(F.desc("revenue"))
+    .limit(10)
+)
+
+# COMMAND ----------
+
+display(daily.orderBy(F.desc("revenue")).limit(5))
