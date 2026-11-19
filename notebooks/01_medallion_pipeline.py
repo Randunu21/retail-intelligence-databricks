@@ -36,8 +36,16 @@ import json
 
 from pyspark.sql import functions as F
 
-from common.tables import BRONZE_TRANSACTIONS, RAW_MANIFEST_PATH, SILVER_RETURNS, SILVER_SALES
+from common.tables import (
+    BRONZE_TRANSACTIONS,
+    PIPELINE_EVENT_LOG,
+    RAW_MANIFEST_PATH,
+    SILVER_DQ_LOG,
+    SILVER_RETURNS,
+    SILVER_SALES,
+)
 from ingestion.raw_reader import RAW_COLUMNS
+from transformations.dq_log import build_dq_log, output_rows_per_flow, rules_frame
 from transformations.silver import (
     BUSINESS_COLUMNS,
     RETURNS_DROP_RULES,
@@ -241,3 +249,117 @@ display(
         staged.filter("is_cancellation"), {**RETURNS_DROP_RULES, **RETURNS_WARN_RULES}
     )
 )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 3. Data-quality log: `retail.silver.dq_log`
+# MAGIC
+# MAGIC **Where the numbers come from:** every pipeline run writes `flow_progress` events to the
+# MAGIC event log (published as `retail.silver.medallion_event_log`). For each expectation they
+# MAGIC hold `passed_records` and `failed_records`. `build_dq_log` turns them into one row per
+# MAGIC **run × dataset × rule** and adds the rule's **action** (`drop` / `warn`) and SQL
+# MAGIC **condition** from the same Python rule dictionaries the pipeline uses.
+# MAGIC
+# MAGIC **Why rebuilt from the full event log every time (`CREATE OR REPLACE`)?** The event log is
+# MAGIC the source of truth and already keeps every run, so rebuilding is idempotent and keeps
+# MAGIC the full history. Re-running this cell never double-counts.
+# MAGIC
+# MAGIC **Reading the numbers:** Lakeflow evaluates each expectation **independently** on the
+# MAGIC same input, so a row that fails two rules is counted under both. That's why the
+# MAGIC per-rule numbers can add up to more than the rows actually removed. Section 3c shows
+# MAGIC the real rows in → rows out.
+
+# COMMAND ----------
+
+event_log = spark.table(PIPELINE_EVENT_LOG)
+dq_log = build_dq_log(event_log, rules_frame(spark))
+dq_log.writeTo(SILVER_DQ_LOG).using("delta").createOrReplace()
+
+dq_log = spark.table(SILVER_DQ_LOG)
+latest_run = dq_log.agg(F.max("run_ts")).collect()[0][0]
+latest = dq_log.filter(F.col("run_ts") == latest_run)
+print("Latest pipeline run with expectations:", latest_run)
+display(latest.orderBy("dataset", "action", F.desc("failed_records")))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3a. Reconciliation: event log vs. independent recount
+# MAGIC The pipeline's numbers must equal the counts computed in section 2e directly from
+# MAGIC Bronze with the same rules. If they match, the DQ log can be trusted.
+
+# COMMAND ----------
+
+recount_sales = count_rule_failures(staged, {**SALES_DROP_RULES, **SALES_WARN_RULES})
+recount_returns = count_rule_failures(
+    staged.filter("is_cancellation"), {**RETURNS_DROP_RULES, **RETURNS_WARN_RULES}
+)
+expected = {}
+for dataset, df in [("sales_validated", recount_sales), ("returns_validated", recount_returns)]:
+    counts = df.collect()[0].asDict()
+    input_rows = counts.pop("input_rows")
+    for rule, failed in counts.items():
+        expected[(dataset, rule)] = (failed, input_rows)
+
+actual = {
+    (r["dataset"], r["rule"]): (r["failed_records"], r["passed_records"] + r["failed_records"])
+    for r in latest.collect()
+}
+mismatches = {
+    k: {"recount": v, "event_log": actual.get(k)} for k, v in expected.items() if actual.get(k) != v
+}
+print(f"Rules checked: {len(expected)} | mismatches: {len(mismatches)}")
+assert not mismatches, mismatches
+print("✅ DQ log matches the independent recount for every rule (failed and total records)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3b. DQ summary for the README / PROGRESS_LOG
+
+# COMMAND ----------
+
+display(
+    latest.select("dataset", "rule", "action", "failed_records", "failed_pct", "condition").orderBy(
+        "dataset", F.desc("action"), F.desc("failed_records")
+    )
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3c. Rows in → rows out (actual effect of the rules)
+# MAGIC Bronze rows → Silver `sales` + `returns`. The difference is what the drop rules removed
+# MAGIC in total (each removed row counted once).
+
+# COMMAND ----------
+
+bronze_rows = bronze.count()
+sales_rows = sales.count()
+returns_rows = returns.count()
+cancellation_rows = staged.filter("is_cancellation").count()
+flow_summary = spark.createDataFrame(
+    [
+        ("bronze rows", bronze_rows),
+        ("sales candidates (non-cancellations)", bronze_rows - cancellation_rows),
+        ("sales rows kept", sales_rows),
+        ("sales rows removed by drop rules", bronze_rows - cancellation_rows - sales_rows),
+        ("returns candidates (cancellations)", cancellation_rows),
+        ("returns rows kept", returns_rows),
+        ("returns rows removed by drop rules", cancellation_rows - returns_rows),
+    ],
+    "step STRING, rows BIGINT",
+)
+display(flow_summary)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Rows written per flow in the latest run, straight from the event log (the pipeline UI
+# MAGIC shows the same numbers rounded).
+
+# COMMAND ----------
+
+latest_update_id = latest.select("update_id").first()[0]
+display(output_rows_per_flow(event_log).filter(F.col("update_id") == latest_update_id))

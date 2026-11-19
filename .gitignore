@@ -48,3 +48,5 @@ data/
 
 # --- Jupyter ---
 .ipynb_checkpoints/
+
+Claude outputs/
