@@ -62,6 +62,11 @@ BUSINESS_COLUMNS: list[str] = [
     "country",
 ]
 
+# Table properties for retail.silver.sales / returns. `invoice_ts` is TIMESTAMP_NTZ, which
+# Delta only stores when the `timestampNtz` table feature is enabled. Pipeline tables can't be
+# ALTERed by hand, so the feature is declared here and passed to the table definitions.
+SILVER_TABLE_PROPERTIES: dict[str, str] = {"delta.feature.timestampNtz": "supported"}
+
 # Final columns of retail.silver.sales and retail.silver.returns.
 SILVER_OUTPUT_COLUMNS: list[str] = [
     "invoice",

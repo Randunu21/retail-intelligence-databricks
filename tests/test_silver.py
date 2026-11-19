@@ -15,6 +15,7 @@ from transformations.silver import (
     RETURNS_DROP_RULES,
     SALES_DROP_RULES,
     SILVER_OUTPUT_COLUMNS,
+    SILVER_TABLE_PROPERTIES,
     apply_drop_rules,
     count_rule_failures,
     stage_silver,
@@ -232,3 +233,10 @@ def test_stock_code_profile_lists_only_non_standard_codes(make_bronze):
     assert prof["POST"]["rows"] == 2
     assert prof["POST"]["treated_as_non_product"] is True
     assert prof["DCGS0058"]["treated_as_non_product"] is False
+
+
+# ---------------------------------------------------------------- table properties
+def test_timestamp_ntz_feature_enabled_when_output_has_ntz(make_bronze):
+    out = sales_of(make_bronze([row("1", "85048")]))
+    if "timestamp_ntz" in dict(out.dtypes).values():
+        assert SILVER_TABLE_PROPERTIES["delta.feature.timestampNtz"] == "supported"

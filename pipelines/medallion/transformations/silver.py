@@ -26,6 +26,7 @@ from transformations.silver import (
     RETURNS_WARN_RULES,
     SALES_DROP_RULES,
     SALES_WARN_RULES,
+    SILVER_TABLE_PROPERTIES,
     stage_silver,
     to_silver_output,
 )
@@ -48,6 +49,7 @@ def sales_validated():
     name=SILVER_SALES,
     comment="Clean product sales lines (no cancellations, duplicates, non-products or invalid "
     "price/quantity). Rows without customer_id are kept with is_missing_customer = true.",
+    table_properties=SILVER_TABLE_PROPERTIES,
 )
 def sales():
     return to_silver_output(spark.read.table("sales_validated"))
@@ -63,6 +65,7 @@ def returns_validated():
 @dp.materialized_view(
     name=SILVER_RETURNS,
     comment="Cancelled/returned product lines. quantity and line_revenue are negative.",
+    table_properties=SILVER_TABLE_PROPERTIES,
 )
 def returns():
     return to_silver_output(spark.read.table("returns_validated"))
