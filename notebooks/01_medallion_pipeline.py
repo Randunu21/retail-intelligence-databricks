@@ -38,6 +38,10 @@ from pyspark.sql import functions as F
 
 from common.tables import (
     BRONZE_TRANSACTIONS,
+    GOLD_DIM_CUSTOMER,
+    GOLD_DIM_DATE,
+    GOLD_DIM_PRODUCT,
+    GOLD_FACT_SALES,
     PIPELINE_EVENT_LOG,
     RAW_MANIFEST_PATH,
     SILVER_DQ_LOG,
@@ -363,3 +367,134 @@ display(flow_summary)
 
 latest_update_id = latest.select("update_id").first()[0]
 display(output_rows_per_flow(event_log).filter(F.col("update_id") == latest_update_id))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4. Gold: star schema
+# MAGIC
+# MAGIC **What belongs in Gold:** business-ready tables shaped for questions ("revenue by month
+# MAGIC and country", "who are our customers"), not for storage. Here: a **star schema**, which is
+# MAGIC one fact table of measurable events surrounded by descriptive dimension tables.
+# MAGIC
+# MAGIC | Table | Built with | Grain / key |
+# MAGIC |---|---|---|
+# MAGIC | `fact_sales` | **Spark SQL** (`gold_fact_sales.sql`) | one row per de-duplicated invoice line · `line_id` |
+# MAGIC | `dim_date` | **Spark SQL** (`gold_dim_date.sql`) | one row per calendar day · `date_key` (yyyyMMdd) |
+# MAGIC | `dim_product` | **DataFrame API** (`build_dim_product`) | one row per `stock_code` |
+# MAGIC | `dim_customer` | **DataFrame API** (`build_dim_customer`) | one row per customer + Unknown · `customer_key` |
+# MAGIC
+# MAGIC **Why that split?** SQL for straight projections and calendar generation (most readable);
+# MAGIC DataFrame API where ONE value must be chosen from many with ranked windows and
+# MAGIC tie-breaks. That logic has edge cases, so it is in tested Python functions.
+# MAGIC
+# MAGIC **Design decisions (interview talking points)**
+# MAGIC - **Grain of `fact_sales`:** the invoice line, the lowest level available, so every
+# MAGIC   aggregate (daily, monthly, per product, per customer) can be derived from it. The source
+# MAGIC   has no line number, so `line_id = xxhash64(business columns)` is a deterministic
+# MAGIC   surrogate key (unique because Silver removed exact duplicates).
+# MAGIC - **Unknown customer = `-1`, not NULL:** 226,761 sales lines have no customer. A NULL
+# MAGIC   foreign key silently disappears in inner joins; a `-1` "Unknown" member keeps revenue
+# MAGIC   totals correct in every join, and analysts filter `is_unknown` when they need to.
+# MAGIC - **Description per stock_code:** the same code appears with several descriptions
+# MAGIC   (typos, renames). `dim_product` keeps the **most frequent** one (ties → most recent) and
+# MAGIC   records `n_description_variants`. Alternatives: latest description (follows renames but
+# MAGIC   one typo can win), or a Type 2 slowly changing dimension (keeps history; overkill here).
+# MAGIC - **Customer country:** a few customers bought from several countries; `dim_customer`
+# MAGIC   keeps the most frequent one, while `fact_sales.country` keeps each sale's own country.
+# MAGIC - **`dim_date` includes days without sales**, so reports show gaps (e.g. Christmas) instead
+# MAGIC   of silently skipping them.
+
+# COMMAND ----------
+
+fact = spark.table(GOLD_FACT_SALES)
+dim_date = spark.table(GOLD_DIM_DATE)
+dim_product = spark.table(GOLD_DIM_PRODUCT)
+dim_customer = spark.table(GOLD_DIM_CUSTOMER)
+
+gold_counts = spark.createDataFrame(
+    [
+        (GOLD_FACT_SALES, fact.count()),
+        (GOLD_DIM_DATE, dim_date.count()),
+        (GOLD_DIM_PRODUCT, dim_product.count()),
+        (GOLD_DIM_CUSTOMER, dim_customer.count()),
+    ],
+    "table STRING, rows BIGINT",
+)
+display(gold_counts)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4a. Star-schema integrity checks
+# MAGIC - Grain: fact rows = Silver sales rows, and `line_id` is unique.
+# MAGIC - Referential integrity: every fact row finds its customer, product and date
+# MAGIC   (a `left_anti` join returns the fact rows that DON'T match, which must be 0).
+# MAGIC - Dimension keys are unique.
+# MAGIC - Revenue is preserved from Silver to Gold.
+
+# COMMAND ----------
+
+gold_checks = {
+    "fact_rows_minus_silver_rows": fact.count() - sales.count(),
+    "duplicate_line_ids": fact.count() - fact.select("line_id").distinct().count(),
+    "orphan_customer_keys": fact.join(dim_customer, "customer_key", "left_anti").count(),
+    "orphan_stock_codes": fact.join(dim_product, "stock_code", "left_anti").count(),
+    "orphan_date_keys": fact.join(dim_date, "date_key", "left_anti").count(),
+    "duplicate_customer_keys": dim_customer.count()
+    - dim_customer.select("customer_key").distinct().count(),
+    "duplicate_stock_codes": dim_product.count()
+    - dim_product.select("stock_code").distinct().count(),
+    "duplicate_date_keys": dim_date.count() - dim_date.select("date_key").distinct().count(),
+    "unknown_customer_rows": dim_customer.filter("is_unknown").count() - 1,
+}
+revenue_gap = (
+    sales.agg(F.sum("line_revenue")).collect()[0][0]
+    - fact.agg(F.sum("line_revenue")).collect()[0][0]
+)
+gold_checks["revenue_silver_minus_gold"] = revenue_gap
+print(gold_checks)
+assert all(v == 0 for v in gold_checks.values()), gold_checks
+print("✅ Star schema checks pass")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4b. How product descriptions were resolved
+# MAGIC Products with the most description variants, and every variant with its line count.
+# MAGIC The `chosen` column shows which one `dim_product` kept.
+
+# COMMAND ----------
+
+top_variant_codes = (
+    dim_product.orderBy(F.desc("n_description_variants"), "stock_code")
+    .limit(5)
+    .select("stock_code", F.col("description").alias("chosen_description"))
+)
+display(
+    sales.join(top_variant_codes, "stock_code")
+    .groupBy("stock_code", "description", "chosen_description")
+    .agg(F.count(F.lit(1)).alias("lines"), F.max("invoice_ts").alias("last_used"))
+    .withColumn("chosen", F.col("description") == F.col("chosen_description"))
+    .drop("chosen_description")
+    .orderBy("stock_code", F.desc("lines"))
+)
+
+# COMMAND ----------
+
+display(dim_product.groupBy("n_description_variants").count().orderBy("n_description_variants"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4c. A first star-schema query: revenue by year-month and customer type
+
+# COMMAND ----------
+
+display(
+    fact.join(dim_date, "date_key")
+    .join(dim_customer, "customer_key")
+    .groupBy("year_month", "is_unknown")
+    .agg(F.sum("line_revenue").alias("revenue"), F.countDistinct("invoice").alias("invoices"))
+    .orderBy("year_month", "is_unknown")
+)
