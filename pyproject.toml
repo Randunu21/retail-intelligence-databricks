@@ -35,7 +35,7 @@ ignore = ["E501"]  # long lines are handled by the formatter
 [tool.ruff.lint.isort]
 known-first-party = [
     "ingestion", "transformations", "features",
-    "segmentation", "modeling", "scoring", "monitoring", "common",
+    "segmentation", "modeling", "scoring", "monitoring", "common", "optimisation",
 ]
 
 [tool.ruff.format]

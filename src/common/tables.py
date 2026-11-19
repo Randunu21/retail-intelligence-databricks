@@ -37,3 +37,15 @@ GOLD_DAILY_SALES = fq("gold", "daily_sales")
 GOLD_MONTHLY_COUNTRY_SALES = fq("gold", "monthly_country_sales")
 GOLD_PRODUCT_PERFORMANCE = fq("gold", "product_performance")
 GOLD_CUSTOMER_COHORT_RETENTION = fq("gold", "customer_cohort_retention")
+
+# Benchmarks (Phase 2) -----------------------------------------------------------------
+# A separate scratch schema keeps experiment tables out of the production layers: every
+# benchmark copy can be dropped with one `DROP SCHEMA retail.bench CASCADE` at the end.
+BENCH_SCHEMA = "bench"
+BENCHMARK_RUNS = fq(BENCH_SCHEMA, "benchmark_runs")
+
+
+def bench_table(prefix: str, logical_name: str) -> str:
+    """Benchmark copy of a table, e.g. bench_table("x1_baseline", "silver_sales")
+    -> retail.bench.x1_baseline__silver_sales (double underscore separates the two parts)."""
+    return fq(BENCH_SCHEMA, f"{prefix}__{logical_name}")
