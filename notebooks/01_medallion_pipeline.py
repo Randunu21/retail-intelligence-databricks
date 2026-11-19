@@ -36,8 +36,18 @@ import json
 
 from pyspark.sql import functions as F
 
-from common.tables import BRONZE_TRANSACTIONS, RAW_MANIFEST_PATH
+from common.tables import BRONZE_TRANSACTIONS, RAW_MANIFEST_PATH, SILVER_RETURNS, SILVER_SALES
 from ingestion.raw_reader import RAW_COLUMNS
+from transformations.silver import (
+    BUSINESS_COLUMNS,
+    RETURNS_DROP_RULES,
+    RETURNS_WARN_RULES,
+    SALES_DROP_RULES,
+    SALES_WARN_RULES,
+    count_rule_failures,
+    stage_silver,
+    stock_code_profile,
+)
 
 # COMMAND ----------
 
@@ -95,3 +105,139 @@ display(bronze_counts_df)
 bronze_counts = {r["_source_file"]: r["rows"] for r in bronze_counts_df.collect()}
 assert bronze_counts == expected_per_file, f"{bronze_counts} != {expected_per_file}"
 print(f"✅ Bronze rows: {sum(bronze_counts.values()):,} (manifest: {manifest['total_rows']:,})")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2. Silver
+# MAGIC
+# MAGIC **What belongs in Silver:** one clean, typed, trustworthy version of each record:
+# MAGIC snake_case names, real types, no duplicates, no rows that aren't product sales. No business
+# MAGIC aggregation yet (that's Gold).
+# MAGIC
+# MAGIC **How the pipeline builds it** (`pipelines/medallion/transformations/silver.py`):
+# MAGIC
+# MAGIC | Dataset | Type | What it does |
+# MAGIC |---|---|---|
+# MAGIC | `silver_staged` | temporary view | Bronze → types, cleaning, flags, `_dup_rank`. Nothing removed. |
+# MAGIC | `sales_validated` | temporary view | **expectations**: drop rules + warn rules |
+# MAGIC | `retail.silver.sales` | materialized view | final columns only |
+# MAGIC | `returns_validated` | temporary view | cancellations only + their expectations |
+# MAGIC | `retail.silver.returns` | materialized view | final columns only |
+# MAGIC
+# MAGIC **Key decisions (interview talking points)**
+# MAGIC - **Cancellations are kept, in their own table**, not dropped: return rates per product/customer
+# MAGIC   are needed in Phases 3–4, and dropping them would silently lose that signal. They are
+# MAGIC   excluded from `sales` so revenue isn't netted in an untraceable way.
+# MAGIC - **Missing `customer_id` is flagged, not dropped** (`is_missing_customer`, warn expectation):
+# MAGIC   those rows are real product sales (needed for product analysis and revenue totals) but are
+# MAGIC   excluded later from customer analysis.
+# MAGIC - **De-duplication on business columns, not on all columns:** the two source sheets overlap
+# MAGIC   (2010-12-01..09), so the same line appears with a different `_source_file`.
+# MAGIC - **`try_cast` instead of `cast`:** serverless runs in ANSI mode, where one bad value would
+# MAGIC   fail the whole run. `try_cast` gives NULL, and a NULL-safe expectation drops and *counts* it.
+# MAGIC - **`TIMESTAMP_NTZ`:** the source times are UK wall-clock times without a zone; NTZ stores
+# MAGIC   them as-is, so dates never shift with the session time zone.
+# MAGIC - **`DECIMAL` for money:** exact arithmetic for `line_revenue = quantity * price` (no float
+# MAGIC   rounding when summing ~1M lines).
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2a. How the non-product stock-code list was found
+# MAGIC Normal product codes are 5 digits + up to 2 letters. Everything else is listed below with
+# MAGIC its description, price range and row count, and was classified by hand. Some odd-looking
+# MAGIC codes are real products (`DCGS*` = dotcomgiftshop items, `PADS`, `SP1002`), so a simple
+# MAGIC "not 5 digits → drop" rule would have been wrong.
+
+# COMMAND ----------
+
+display(stock_code_profile(bronze))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2b. The rules (exactly what the pipeline's expectations use)
+
+# COMMAND ----------
+
+for title, rules in [
+    ("sales: DROP", SALES_DROP_RULES),
+    ("sales: WARN (kept, counted)", SALES_WARN_RULES),
+    ("returns: DROP", RETURNS_DROP_RULES),
+    ("returns: WARN (kept, counted)", RETURNS_WARN_RULES),
+]:
+    print(f"\n{title}")
+    for name, cond in rules.items():
+        print(f"  {name:<20} {cond}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2c. Silver row counts
+
+# COMMAND ----------
+
+sales = spark.table(SILVER_SALES)
+returns = spark.table(SILVER_RETURNS)
+
+silver_counts = sales.agg(
+    F.count(F.lit(1)).alias("sales_rows"),
+    F.sum(F.col("is_missing_customer").cast("int")).alias("sales_missing_customer"),
+    F.sum("line_revenue").alias("sales_revenue"),
+).crossJoin(
+    returns.agg(
+        F.count(F.lit(1)).alias("returns_rows"),
+        F.sum("line_revenue").alias("returns_value"),
+    )
+)
+display(silver_counts)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2d. Invariants: things that must be true of Silver
+# MAGIC If any of these fail, a rule is wrong. The pipeline would still "succeed", which is
+# MAGIC exactly why we check.
+
+# COMMAND ----------
+
+checks = (
+    sales.agg(
+        F.sum(F.col("invoice").startswith("C").cast("int")).alias("cancellations_in_sales"),
+        F.sum((F.col("price") <= 0).cast("int")).alias("non_positive_price"),
+        F.sum((F.col("quantity") <= 0).cast("int")).alias("non_positive_quantity"),
+        F.sum(F.col("invoice_ts").isNull().cast("int")).alias("null_invoice_ts"),
+    )
+    .collect()[0]
+    .asDict()
+)
+checks["duplicate_groups_in_sales"] = (
+    sales.groupBy(*BUSINESS_COLUMNS).count().filter("count > 1").count()
+)
+checks["non_cancellations_in_returns"] = returns.filter(~F.col("invoice").startswith("C")).count()
+print(checks)
+assert all(v == 0 for v in checks.values()), checks
+print("✅ Silver invariants hold")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2e. Recomputed rule counts (cross-check for the DQ log)
+# MAGIC The same rules applied here, outside the pipeline, to the Bronze rows. Each rule is
+# MAGIC counted **independently** (a POST line with price 0 fails `is_product` *and*
+# MAGIC `positive_price`), the same way Lakeflow counts expectations. In step 1.3 these
+# MAGIC numbers must match the pipeline's event log.
+
+# COMMAND ----------
+
+staged = stage_silver(bronze)
+display(count_rule_failures(staged, {**SALES_DROP_RULES, **SALES_WARN_RULES}))
+
+# COMMAND ----------
+
+display(
+    count_rule_failures(
+        staged.filter("is_cancellation"), {**RETURNS_DROP_RULES, **RETURNS_WARN_RULES}
+    )
+)
