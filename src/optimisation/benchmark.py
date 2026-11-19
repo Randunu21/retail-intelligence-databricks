@@ -156,6 +156,9 @@ class Variant:
     names: Mapping[str, str]
     write_specs: Mapping[str, WriteSpec] = field(default_factory=dict)
     step_overrides: Mapping[str, Callable[[BuildContext], DataFrame]] = field(default_factory=dict)
+    # Maintenance run right after a step's write (e.g. OPTIMIZE). Timed separately and
+    # recorded as step "<step>__post" so write cost and maintenance cost stay visible.
+    post_write: Mapping[str, Callable[[SparkSession, str], object]] = field(default_factory=dict)
     notes: str = ""
 
     def spec_for(self, step: str) -> WriteSpec:
@@ -238,15 +241,20 @@ def compare(summary: DataFrame, before: str, after: str) -> DataFrame:
     )
 
 
-def latest_run_id(runs: DataFrame, experiment: str, scale: str) -> str | None:
+def latest_run_id(
+    runs: DataFrame, experiment: str, scale: str, layer: str | None = None
+) -> str | None:
     """run_id of the most recent run of (experiment, scale) that covered the most steps.
 
-    Lets the notebook reuse a recorded baseline instead of re-timing it on every visit.
-    Runs that only re-timed a few steps (`only_steps`) lose to a full run.
+    Lets the notebook reuse a recorded run instead of re-timing it on every visit.
+    Runs that only re-timed a few steps (`only_steps`) lose to a full run. `layer`
+    ("silver", "gold", "read", ...) separates build runs from read-query runs.
     """
+    selected = runs.filter((F.col("experiment") == experiment) & (F.col("scale") == scale))
+    if layer is not None:
+        selected = selected.filter(F.col("layer") == layer)
     row = (
-        runs.filter((F.col("experiment") == experiment) & (F.col("scale") == scale))
-        .groupBy("run_id")
+        selected.groupBy("run_id")
         .agg(F.countDistinct("step").alias("steps"), F.max("started_at").alias("last"))
         .orderBy(F.desc("steps"), F.desc("last"))
         .first()
@@ -333,6 +341,29 @@ def save_runs(spark: SparkSession, records: Sequence[Mapping[str, object]], tabl
     records_to_df(spark, records).write.mode("append").saveAsTable(table)
 
 
+def _record(run_id, v, scale, step, order, layer, t, target, rows, detail, version, notes):
+    return {
+        "run_id": run_id,
+        "experiment": v.experiment,
+        "scale": scale,
+        "step": step,
+        "step_order": order,
+        "layer": layer,
+        "repetition": t.repetition,
+        "is_warmup": t.is_warmup,
+        "duration_s": round(t.seconds, 4),
+        "output_table": target,
+        "output_rows": rows,
+        **asdict(detail),
+        "spark_version": version,
+        "notes": notes,
+        "started_at": t.started_at,
+    }
+
+
+POST_SUFFIX = "__post"
+
+
 def run_benchmark(
     spark: SparkSession,
     steps: Sequence[BuildStep],
@@ -351,57 +382,181 @@ def run_benchmark(
     Loop order: step -> repetition -> variant. Each step is finished for all variants before
     the next step starts, so downstream steps always read upstream tables that exist.
     `only_steps` re-times a subset (their inputs must already exist in each variant's names).
+    A variant's `post_write` action (e.g. OPTIMIZE) runs right after each write and is
+    recorded as a separate step `<step>__post`.
     """
     check_step_order(steps)
     run_id = str(uuid.uuid4())
-    spark_version = spark.version
-    selected = [s for s in steps if only_steps is None or s.name in only_steps]
+    version = spark.version
+    selected = {s.name for s in steps if only_steps is None or s.name in only_steps}
     records: list[dict[str, object]] = []
 
     for order, step in enumerate(steps, start=1):
-        if step not in selected:
+        if step.name not in selected:
             continue
-        actions = {}
-        for v in variants:
-            ctx = BuildContext(spark, v.names, Path(pipeline_dir))
-            build = v.step_overrides.get(step.name, step.build)
-            target, spec = v.names[step.name], v.spec_for(step.name)
-            actions[v.experiment] = lambda b=build, c=ctx, t=target, s=spec: write_table(b(c), t, s)
-
-        timings: dict[str, list[Timing]] = {v.experiment: [] for v in variants}
+        writes: dict[str, list[Timing]] = {v.experiment: [] for v in variants}
+        posts: dict[str, list[Timing]] = {v.experiment: [] for v in variants}
         for rep in range(1, warmup + repetitions + 1):
             for v in variants:  # interleaved: A, B, A, B, ...
-                t = repeat_timed(actions[v.experiment], repetitions=1, warmup=0)[0]
-                timings[v.experiment].append(Timing(rep, rep <= warmup, t.seconds, t.started_at))
-                tag = " (warm-up)" if rep <= warmup else ""
-                log(
-                    f"[{scale}] {step.name:<32} {v.experiment:<24} rep {rep}: {t.seconds:7.2f}s{tag}"
-                )
+                ctx = BuildContext(spark, v.names, Path(pipeline_dir))
+                build = v.step_overrides.get(step.name, step.build)
+                target = v.names[step.name]
+                spec = v.spec_for(step.name)
+                t = repeat_timed(
+                    lambda b=build, c=ctx, tg=target, s=spec: write_table(b(c), tg, s), 1, 0
+                )[0]
+                writes[v.experiment].append(Timing(rep, rep <= warmup, t.seconds, t.started_at))
+                msg = f"[{scale}] {step.name:<32} {v.experiment:<24} rep {rep}: {t.seconds:7.2f}s"
+                post = v.post_write.get(step.name)
+                if post:
+                    p = repeat_timed(lambda f=post, tg=target: f(spark, tg), 1, 0)[0]
+                    posts[v.experiment].append(Timing(rep, rep <= warmup, p.seconds, p.started_at))
+                    msg += f"  + post {p.seconds:6.2f}s"
+                log(msg + (" (warm-up)" if rep <= warmup else ""))
 
         for v in variants:
             target = v.names[step.name]
-            detail = describe_detail(spark, target)
+            detail = describe_detail(spark, target)  # after the last write (+ post action)
             rows = spark.read.table(target).count()
-            for t in timings[v.experiment]:
-                records.append(
-                    {
-                        "run_id": run_id,
-                        "experiment": v.experiment,
-                        "scale": scale,
-                        "step": step.name,
-                        "step_order": order,
-                        "layer": step.layer,
-                        "repetition": t.repetition,
-                        "is_warmup": t.is_warmup,
-                        "duration_s": round(t.seconds, 4),
-                        "output_table": target,
-                        "output_rows": rows,
-                        **{k: v_ for k, v_ in asdict(detail).items()},
-                        "spark_version": spark_version,
-                        "notes": f"{v.spec_for(step.name).describe()}; {v.notes}".strip("; "),
-                        "started_at": t.started_at,
-                    }
-                )
+            notes = f"{v.spec_for(step.name).describe()}; {v.notes}".strip("; ")
+            for t in writes[v.experiment]:
+                records.append(_record(run_id, v, scale, step.name, order, step.layer, t,
+                                       target, rows, detail, version, notes))  # fmt: skip
+            for t in posts[v.experiment]:
+                records.append(_record(run_id, v, scale, step.name + POST_SUFFIX, order, "post",
+                                       t, target, rows, detail, version, notes))  # fmt: skip
         if runs_table:  # save after each step: a quota stop mid-run keeps what was measured
-            save_runs(spark, [r for r in records if r["step"] == step.name], runs_table)
+            save_runs(spark, [r for r in records if r["step"].startswith(step.name)], runs_table)
     return records
+
+
+# ----------------------------------------------------------------------------------------
+# Read benchmarks: how fast are typical queries against each layout variant?
+# ----------------------------------------------------------------------------------------
+READ_PREFIX = "read:"
+_TAG_PATTERN = r"bench:([0-9a-f-]{36}):([A-Za-z0-9_]+):([A-Za-z0-9_]+):([0-9]+)"
+
+
+def query_tag(run_id: str, experiment: str, query: str, repetition: int) -> str:
+    return f"bench:{run_id}:{experiment}:{query}:{repetition}"
+
+
+def tagged_sql(sql: str, tag: str) -> str:
+    """Wrap a query so its text carries a unique tag without changing its result.
+
+    The tag (1) makes every execution's SQL text unique, so no result cache can answer it,
+    and (2) lets us find this exact execution in `system.query.history` afterwards. It sits
+    in a string literal (always kept in the statement text) in a predicate that is always
+    true; the optimiser folds it away, so the plan is the same as the untagged query.
+    """
+    return f"SELECT * FROM (\n{sql.strip()}\n) WHERE '{tag}' <> ''"
+
+
+def run_read_benchmark(
+    spark: SparkSession,
+    queries: Mapping[str, str],
+    variants: Sequence[Variant],
+    *,
+    scale: str,
+    table_step: str = "gold_fact_sales",
+    repetitions: int = 5,
+    warmup: int = 1,
+    runs_table: str | None = None,
+    log: Callable[[str], None] = print,
+) -> list[dict[str, object]]:
+    """Time each query (SQL with a `{table}` placeholder) against each variant's table.
+
+    Execution = `collect()` of the tagged query: the results are small aggregates or one
+    customer's lines, so collecting is cheap and runs the whole plan. Interleaved like the
+    build benchmark. Recorded as step `read:<query>`, layer "read".
+    """
+    run_id = str(uuid.uuid4())
+    version = spark.version
+    records: list[dict[str, object]] = []
+    for order, (qname, sql) in enumerate(queries.items(), start=1):
+        timings: dict[str, list[Timing]] = {v.experiment: [] for v in variants}
+        for rep in range(1, warmup + repetitions + 1):
+            for v in variants:
+                q = tagged_sql(
+                    sql.format(table=v.names[table_step]),
+                    query_tag(run_id, v.experiment, qname, rep),
+                )
+                t = repeat_timed(lambda q=q: spark.sql(q).collect(), 1, 0)[0]
+                timings[v.experiment].append(Timing(rep, rep <= warmup, t.seconds, t.started_at))
+                warm = " (warm-up)" if rep <= warmup else ""
+                log(
+                    f"[{scale}] {READ_PREFIX}{qname:<24} {v.experiment:<16} rep {rep}: {t.seconds:6.2f}s{warm}"
+                )
+        for v in variants:
+            table = v.names[table_step]
+            detail = describe_detail(spark, table)
+            rows = spark.sql(sql.format(table=table)).count()  # result rows, equal across variants
+            for t in timings[v.experiment]:
+                records.append(_record(run_id, v, scale, READ_PREFIX + qname, order, "read", t,
+                                       table, rows, detail, version, v.spec_for(table_step).describe()))  # fmt: skip
+        if runs_table:
+            save_runs(spark, [r for r in records if r["step"] == READ_PREFIX + qname], runs_table)
+    return records
+
+
+QUERY_HISTORY_COLUMNS = [
+    "statement_id",
+    "statement_text",
+    "start_time",
+    "total_duration_ms",
+    "read_files",
+    "pruned_files",
+    "read_bytes",
+    "read_rows",
+    "from_result_cache",
+    "read_io_cache_percent",
+]
+
+
+def with_tag_columns(history: DataFrame) -> DataFrame:
+    """Parse run_id / experiment / query / repetition out of tagged statement texts."""
+    text = F.col("statement_text")
+    return (
+        history.withColumn("run_id", F.regexp_extract(text, _TAG_PATTERN, 1))
+        .withColumn("experiment", F.regexp_extract(text, _TAG_PATTERN, 2))
+        .withColumn("query", F.regexp_extract(text, _TAG_PATTERN, 3))
+        .withColumn("repetition", F.regexp_extract(text, _TAG_PATTERN, 4).cast("int"))
+        .filter(F.col("run_id") != "")
+    )
+
+
+def query_history_for_run(spark: SparkSession, run_id: str) -> DataFrame:
+    """Per-execution I/O metrics of one read benchmark run, from system.query.history.
+
+    The system table is filled with a delay (usually a few minutes), so run this a little
+    after the benchmark. Only finished statements of this run are returned.
+    """
+    cols = ", ".join(QUERY_HISTORY_COLUMNS)
+    history = spark.sql(
+        f"SELECT {cols} FROM system.query.history "
+        f"WHERE statement_text LIKE '%bench:{run_id}:%' AND execution_status = 'FINISHED' "
+        "AND start_time > current_timestamp() - INTERVAL 7 DAYS"
+    )
+    return with_tag_columns(history)
+
+
+def summarise_reads(history: DataFrame, warmup: int = 1) -> DataFrame:
+    """Median I/O per (experiment, query) over the measured (non-warm-up) executions.
+
+    files_read / files_pruned come from Delta data skipping (min/max statistics per file);
+    read_mb and rows_read also drop when Parquet row groups inside a file are skipped.
+    """
+    measured = history.filter(F.col("repetition") > warmup)
+    return (
+        measured.groupBy("experiment", "query")
+        .agg(
+            F.count(F.lit(1)).alias("n"),
+            F.median("total_duration_ms").alias("server_ms"),
+            F.median("read_files").alias("files_read"),
+            F.median("pruned_files").alias("files_pruned"),
+            F.round(F.median("read_bytes") / (1024 * 1024), 2).alias("read_mb"),
+            F.median("read_rows").alias("rows_read"),
+            F.max(F.col("from_result_cache").cast("int")).alias("any_result_cache"),
+        )
+        .orderBy("query", "experiment")
+    )

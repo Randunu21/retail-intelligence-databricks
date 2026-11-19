@@ -67,23 +67,64 @@ this size. `silver_returns` (17,915 rows, 3.231 s) re-runs the full Bronze stagi
   (`R03-489434`, cancellations `CR03-489449`), so they are new customers and invoices, not
   duplicates. Products, prices, dates, countries and data-quality issues are unchanged.
 - Check: Silver/fact rows exactly 10× x1, customers 10 × 5,852 + Unknown, products/dates/
-  monthly/cohort tables unchanged, revenue exactly 10×: `<<X10_SCALE_CHECK>>`.
+  monthly/cohort tables unchanged, revenue exactly 10× (196,438,616.370 vs 19,643,861.637): **all 11 checks passed**.
 - Limits: no new behaviour (same patterns with relabelled keys). Every x10 figure is labelled
   "synthetic x10 replica" and shown next to the x1 figure.
 
-| Step | x1 median s | x10 median s | Time ratio | x10 files | x10 MB |
-|---|---:|---:|---:|---:|---:|
-| `<<filled from notebook §4c>>` | | | | | |
+Baseline at x10: run `39753a7e-fba8-4f8c-8117-72605897c2b9`, 2026-11-20, 1 warm-up + 3 measured runs.
+
+| Step | x1 median s | x10 median s (min–max) | Time ratio | Rows ratio | x10 files | x10 MB |
+|---|---:|---:|---:|---:|---:|---:|
+| silver_sales | 6.664 | 37.557 (37.159–37.955) | 5.64 | 10.0 | 6 | 78.47 |
+| silver_returns | 3.231 | 8.337 (8.143–8.364) | 2.58 | 10.0 | 1 | 0.83 |
+| gold_dim_date | 2.616 | 2.557 (2.551–2.812) | 0.98 | 1.0 | 1 | 0.00 |
+| gold_fact_sales | 2.774 | 5.866 (5.610–5.870) | 2.11 | 10.0 | 1 | 136.84 |
+| gold_dim_product | 2.907 | 3.141 (2.983–3.436) | 1.08 | 1.0 | 1 | 0.07 |
+| gold_dim_customer | 2.768 | 2.779 (2.567–2.817) | 1.00 | 10.0 | 2 | 0.54 |
+| gold_daily_sales | 2.861 | 4.027 (3.971–4.546) | 1.41 | 1.0 | 1 | 0.02 |
+| gold_monthly_country_sales | 3.069 | 4.660 (4.296–5.689) | 1.52 | 1.0 | 1 | 0.01 |
+| gold_product_performance | 3.605 | 4.396 (4.386–4.420) | 1.22 | 1.0 | 1 | 0.14 |
+| gold_customer_cohort_retention | 3.421 | 3.708 (3.466–3.846) | 1.08 | 1.0 | 1 | 0.01 |
+| **Total (sum of medians)** | **33.916** | **77.028** (75.132–79.755) | 2.27 | | 16 | 216.93 |
+
+**Reading:** 10× the rows costs 2.27× the time, because most x1 time was fixed overhead.
+Silver is the bottleneck at scale: `silver_sales` alone is 49 % of the x10 build and the only
+step whose time grows close to the data (×5.64); with `silver_returns` (which re-runs the
+same staging for 179,150 rows) Silver is 60 %. `fact_sales` is a single 136.84 MB file at
+x10, so no query against it can skip files with the default layout.
 
 ## 4. Changes, one at a time
 
+### 4.1 Data layout of `gold.fact_sales` (step 2.3)
+
+Variants (`optimisation.layout`): `baseline` (defaults), `part_date` (PARTITIONED BY date_key),
+`zorder_32mb` (OPTIMIZE ZORDER BY date_key, customer_key; 32 MB target files), `lc_auto`
+(CLUSTER BY date_key, customer_key + OPTIMIZE), `lc_32mb` (same, 32 MB target files).
+Same data in every variant: `<<LAYOUT_FINGERPRINT>>`.
+
+**Build cost** (write + OPTIMIZE):
+
+| Scale | Variant | Write s | OPTIMIZE s | Total s | Files | MB |
+|---|---|---:|---:|---:|---:|---:|
+| `<<from notebook §5a>>` | | | | | | |
+
+**Read cost** (median of 5; files/bytes from `system.query.history`):
+
+| Scale | Query | Variant | Client s | Server ms | Files read | Files pruned | MB read |
+|---|---|---|---:|---:|---:|---:|---:|
+| `<<from notebook §5b–5c>>` | | | | | | | |
+
+**Conclusion:** `<<>>`
+
+### 4.2 Summary of all changes
+
 | # | Change | Why | Metric | Before | After | % change | Beyond noise? |
 |---|---|---|---|---:|---:|---:|---|
-| 1 | Liquid clustering on `<<keys>>` + `OPTIMIZE` | | | | | | |
-| 2 | Partitioning by `<<key>>` (compared, not adopted?) | | | | | | |
+| 1 | Liquid clustering on `(date_key, customer_key)` + `OPTIMIZE` | | | | | | |
+| 2 | Partitioning by `date_key` (compared) | | | | | | |
 | 3 | Broadcast hints for small dimensions | | | | | | |
 | 4 | Early projection / filtering, fewer shuffles | | | | | | |
-| 5 | Stage Silver once (Delta table instead of `cache()`) | | | | | | |
+| 5 | Stage Silver once (instead of computing it twice) | | | | | | |
 | 6 | Incremental `MERGE` + CDF instead of full rebuild | | | | | | |
 
 ## 5. Evidence

@@ -40,6 +40,7 @@ from pyspark.sql import functions as F
 
 from common.tables import (
     BENCH_SCHEMA,
+    BENCHMARK_QUERY_METRICS,
     BENCHMARK_RUNS,
     BRONZE_TRANSACTIONS,
     CATALOG,
@@ -47,6 +48,7 @@ from common.tables import (
     fq,
 )
 from optimisation.benchmark import (
+    POST_SUFFIX,
     Variant,
     WriteSpec,
     compare_scales,
@@ -55,11 +57,15 @@ from optimisation.benchmark import (
     latest_run_id,
     markdown_table,
     pipeline_totals,
+    query_history_for_run,
     run_benchmark,
+    run_read_benchmark,
     summarise,
+    summarise_reads,
     write_table,
 )
 from optimisation.builds import BASELINE_STEPS, PROD_NAMES, bench_names
+from optimisation.layout import FACT_STEP, LAYOUT_QUERIES, layout_variants
 from optimisation.scaling import expected_rows, replicate_bronze
 
 spark.sql(
@@ -522,3 +528,218 @@ print(
         ],
     )
 )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4d. What x10 tells us (run 39753a7e, 2026-11-20)
+# MAGIC
+# MAGIC - Whole build: **33.9 s → 77.0 s** for 10× the rows (×2.27): much of the x1 time was overhead.
+# MAGIC - **Silver is where the time goes:** `silver_sales` 37.6 s (49 % of the total, time ×5.64)
+# MAGIC   and `silver_returns` 8.3 s, together 60 %. Both re-run the same typing + window de-dup
+# MAGIC   over 10.7M Bronze rows; returns needs it for 179,150 rows. → targets for step 2.4
+# MAGIC   (stage once) and 2.5 (incremental instead of full rebuild).
+# MAGIC - `fact_sales` (10M rows) takes 5.9 s and is **one 136.84 MB file**: Databricks sized the
+# MAGIC   file from the table size. One file can't be skipped, which matters for reads (section 5).
+# MAGIC - Dimensions and marts stay at 2.6–4.7 s: still mostly fixed per-write overhead.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5. Data layout of `fact_sales`: partitioning vs Z-order vs liquid clustering
+# MAGIC
+# MAGIC Layout doesn't make a table faster to *build*; it makes *queries* read less. Delta keeps
+# MAGIC min/max statistics per file, so a filter like `date_key BETWEEN ...` can skip every file
+# MAGIC whose range doesn't overlap (**data skipping**). That only works if (a) similar values sit
+# MAGIC in the same files and (b) there is more than one file.
+# MAGIC
+# MAGIC | Option | How it lays out data | Strengths | Weaknesses |
+# MAGIC |---|---|---|---|
+# MAGIC | **Partitioning** (`PARTITIONED BY date_key`) | One folder per value | Perfect pruning on that column | Fixed at creation; one key; high-cardinality keys → thousands of tiny files (here ~600 days); no help for other columns |
+# MAGIC | **Z-order** (`OPTIMIZE ZORDER BY`) | Sorts files along a space-filling curve of several columns | Multi-column skipping | Each OPTIMIZE rewrites the whole table/partition; keys not stored with the table; must be re-run after writes |
+# MAGIC | **Liquid clustering** (`CLUSTER BY`) | Clustering keys stored in the table; OPTIMIZE clusters incrementally | Multi-column, keys changeable without rewrite, incremental, row-level concurrency, recommended for new tables | Needs OPTIMIZE (or predictive optimisation) to cluster; little effect on tiny tables |
+# MAGIC
+# MAGIC **Why over-partitioning small data hurts:** every partition value gets its own files, so
+# MAGIC ~600 days × a few hundred KB each = hundreds of tiny files. Each file costs a listing,
+# MAGIC an open and a metadata entry, which dominates the actual read; and any query that doesn't
+# MAGIC filter on the partition column (a customer lookup) must open all of them. The usual rule
+# MAGIC of thumb: only partition tables above ~1 TB, with partitions of at least ~1 GB.
+# MAGIC
+# MAGIC Five variants of `fact_sales` (see `optimisation.layout`), all built from the same
+# MAGIC baseline Silver: `baseline`, `part_date`, `zorder_32mb`, `lc_auto`, `lc_32mb`. Measured:
+# MAGIC 1. **Build cost** (5a): the write, plus `OPTIMIZE` timed separately (`__post`).
+# MAGIC 2. **Read cost** (5c–5d): three queries: one month by country (date filter), one customer
+# MAGIC    (customer filter) and all countries (no filter, a control that layout can't help).
+# MAGIC
+# MAGIC Run at x1 *and* x10: at x1 the honest expectation is "no difference".
+
+# COMMAND ----------
+
+LAYOUT_SCALES = {"x1": baseline_x1, SCALE: baseline_xn}
+RUN_LAYOUT_BUILD = True
+LAYOUT_REPS = 3
+
+layout = {s: layout_variants(base.names, s) for s, base in LAYOUT_SCALES.items()}
+
+if RUN_LAYOUT_BUILD:
+    for s, variants in layout.items():
+        run_benchmark(
+            spark,
+            BASELINE_STEPS,
+            variants,
+            scale=s,
+            pipeline_dir=PIPELINE_DIR,
+            repetitions=LAYOUT_REPS,
+            warmup=WARMUP,
+            only_steps=[FACT_STEP],
+            runs_table=BENCHMARK_RUNS,
+        )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5a. Same data in every layout? And what each layout costs to build
+# MAGIC
+# MAGIC First the fingerprint check (a layout must never change the data), then per variant:
+# MAGIC write time, OPTIMIZE time, files and size after OPTIMIZE.
+
+# COMMAND ----------
+
+all_runs = spark.read.table(BENCHMARK_RUNS)
+layout_build = []
+for s, variants in layout.items():
+    ref = fingerprint(spark.read.table(LAYOUT_SCALES[s].names[FACT_STEP])).first()
+    run_id = latest_run_id(all_runs, "lc_32mb", s, layer="gold")
+    summ = {
+        r.step + "|" + r.experiment: r
+        for r in summarise(all_runs.filter(F.col("run_id") == run_id)).collect()
+    }
+    for v in variants:
+        same = fingerprint(spark.read.table(v.names[FACT_STEP])).first() == ref
+        w = summ[f"{FACT_STEP}|{v.experiment}"]
+        post = summ.get(f"{FACT_STEP}{POST_SUFFIX}|{v.experiment}")
+        layout_build.append(
+            {
+                "scale": s,
+                "experiment": v.experiment,
+                "same_data": same,
+                "write_s": w.median_s,
+                "write_range": f"{w.min_s}-{w.max_s}",
+                "optimize_s": post.median_s if post else 0.0,
+                "total_s": round(w.median_s + (post.median_s if post else 0.0), 3),
+                "files": w.num_files,
+                "size_mb": w.size_mb,
+                "layout": w.clustering_columns or w.partition_columns or "-",
+            }
+        )
+print(
+    markdown_table(
+        layout_build,
+        [
+            "scale",
+            "experiment",
+            "same_data",
+            "write_s",
+            "write_range",
+            "optimize_s",
+            "total_s",
+            "files",
+            "size_mb",
+            "layout",
+        ],
+    )
+)
+assert all(r["same_data"] for r in layout_build), "A layout variant changed the data"
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5b. Read benchmark
+# MAGIC
+# MAGIC Each query runs 1 warm-up + 5 measured times per variant, interleaved. Every execution's
+# MAGIC SQL carries a unique tag (`tagged_sql`): no result cache can answer it, and section 5c
+# MAGIC can find that exact execution in `system.query.history`.
+
+# COMMAND ----------
+
+RUN_LAYOUT_READS = True
+READ_REPS = 5
+
+if RUN_LAYOUT_READS:
+    for s, variants in layout.items():
+        run_read_benchmark(
+            spark,
+            LAYOUT_QUERIES,
+            variants,
+            scale=s,
+            repetitions=READ_REPS,
+            warmup=WARMUP,
+            runs_table=BENCHMARK_RUNS,
+        )
+
+all_runs = spark.read.table(BENCHMARK_RUNS)
+READ_RUN_IDS = {s: latest_run_id(all_runs, "lc_32mb", s, layer="read") for s in layout}
+print(READ_RUN_IDS)
+reads_time = summarise(all_runs.filter(F.col("run_id").isin(*READ_RUN_IDS.values())))
+print(
+    markdown_table(
+        [r.asDict() for r in reads_time.collect()],
+        ["scale", "step", "experiment", "median_s", "min_s", "max_s", "output_rows"],
+    )
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5c. Files and bytes actually read (`system.query.history`)
+# MAGIC
+# MAGIC Wall-clock time on a fast query is noisy; **files read vs pruned** and **bytes read** are
+# MAGIC not. The system table fills with a delay: if `matched` is below `expected`, wait a few
+# MAGIC minutes and run this cell again (it only reads, nothing is re-timed).
+# MAGIC
+# MAGIC - `files_pruned` > 0 → data skipping worked at file level.
+# MAGIC - `read_mb` / `rows_read` lower with the same `files_read` → skipping of Parquet row
+# MAGIC   groups *inside* a file (sorted data helps there too).
+# MAGIC - `any_result_cache` must be 0, otherwise a timing came from a cache.
+
+# COMMAND ----------
+
+metrics = None
+for s, rid in READ_RUN_IDS.items():
+    h = query_history_for_run(spark, rid).withColumn("scale", F.lit(s))
+    metrics = h if metrics is None else metrics.unionByName(h)
+
+expected = len(LAYOUT_QUERIES) * (WARMUP + READ_REPS) * 5 * len(READ_RUN_IDS)
+matched = metrics.count()
+print(f"matched {matched} of {expected} executions in system.query.history")
+
+if matched:
+    (
+        metrics.drop("statement_text")
+        .withColumn("captured_at", F.current_timestamp())
+        .write.mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(BENCHMARK_QUERY_METRICS)
+    )
+    reads_io = spark.read.table(BENCHMARK_QUERY_METRICS)
+    rows = []
+    for s in READ_RUN_IDS:
+        for r in summarise_reads(reads_io.filter(F.col("scale") == s)).collect():
+            rows.append({"scale": s, **r.asDict()})
+    print(
+        markdown_table(
+            rows,
+            [
+                "scale",
+                "query",
+                "experiment",
+                "n",
+                "server_ms",
+                "files_read",
+                "files_pruned",
+                "read_mb",
+                "rows_read",
+                "any_result_cache",
+            ],
+        )
+    )

@@ -187,6 +187,8 @@ def test_latest_run_id_prefers_full_then_recent(spark):
     )
     assert latest_run_id(runs, "baseline", "x1") == "old_full"
     assert latest_run_id(runs, "baseline", "x10") is None
+    assert latest_run_id(runs, "baseline", "x1", layer="silver") == "old_full"
+    assert latest_run_id(runs, "baseline", "x1", layer="read") is None
 
 
 def test_compare_scales_ratios(spark):
@@ -197,3 +199,42 @@ def test_compare_scales_ratios(spark):
     out = compare_scales(summarise(records_to_df(spark, recs)), "x1", "x10").first()
     assert (out.time_ratio, out.rows_ratio) == (4.5, 10.0)
     assert out.median_s_x1 == 2.0 and out.median_s_x10 == 9.0
+
+
+def test_tagged_sql_keeps_result_and_carries_tag(spark):
+    from optimisation.benchmark import query_tag, tagged_sql
+
+    tag = query_tag("1dea80f3-2ee2-4db2-a73e-be81433918ab", "lc_32mb", "one_customer", 3)
+    q = tagged_sql("SELECT 1 AS a UNION ALL SELECT 2 AS a", tag)
+    assert tag in q
+    assert sorted(r.a for r in spark.sql(q).collect()) == [1, 2]
+
+
+def test_with_tag_columns_parses_and_drops_untagged(spark):
+    from optimisation.benchmark import query_tag, tagged_sql, with_tag_columns
+
+    run = "39753a7e-fba8-4f8c-8117-72605897c2b9"
+    texts = [tagged_sql("SELECT 1", query_tag(run, "part_date", "month_by_country", 2)),
+             "SELECT 1"]  # fmt: skip
+    df = with_tag_columns(spark.createDataFrame([(t,) for t in texts], "statement_text STRING"))
+    rows = df.collect()
+    assert len(rows) == 1
+    assert (rows[0].run_id, rows[0].experiment, rows[0].query, rows[0].repetition) == (
+        run, "part_date", "month_by_country", 2)  # fmt: skip
+
+
+def test_summarise_reads_skips_warmup(spark):
+    from optimisation.benchmark import summarise_reads
+
+    schema = ("experiment STRING, query STRING, repetition INT, total_duration_ms BIGINT, "
+              "read_files BIGINT, pruned_files BIGINT, read_bytes BIGINT, read_rows BIGINT, "
+              "from_result_cache BOOLEAN")  # fmt: skip
+    rows = [
+        ("lc", "q", 1, 900, 9, 0, 9 * 2**20, 900, False),  # warm-up, ignored
+        ("lc", "q", 2, 100, 1, 8, 2**20, 100, False),
+        ("lc", "q", 3, 120, 1, 8, 2**20, 100, False),
+        ("lc", "q", 4, 110, 1, 8, 2**20, 100, False),
+    ]
+    out = summarise_reads(spark.createDataFrame(rows, schema)).first()
+    assert (out.n, out.server_ms, out.files_read, out.files_pruned) == (3, 110, 1, 8)
+    assert out.read_mb == 1.0 and out.any_result_cache == 0

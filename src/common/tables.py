@@ -43,6 +43,8 @@ GOLD_CUSTOMER_COHORT_RETENTION = fq("gold", "customer_cohort_retention")
 # benchmark copy can be dropped with one `DROP SCHEMA retail.bench CASCADE` at the end.
 BENCH_SCHEMA = "bench"
 BENCHMARK_RUNS = fq(BENCH_SCHEMA, "benchmark_runs")
+# Per-execution I/O of read benchmarks, copied from system.query.history (files read/pruned).
+BENCHMARK_QUERY_METRICS = fq(BENCH_SCHEMA, "benchmark_query_metrics")
 
 
 def bench_table(prefix: str, logical_name: str) -> str:
