@@ -24,6 +24,7 @@
 # COMMAND ----------
 
 import sys
+import uuid
 from pathlib import Path
 
 REPO_DIR = Path.cwd().parent
@@ -40,6 +41,7 @@ from pyspark.sql import functions as F
 
 from common.tables import (
     BENCH_SCHEMA,
+    BENCHMARK_IO_PROBES,
     BENCHMARK_QUERY_METRICS,
     BENCHMARK_RUNS,
     BRONZE_TRANSACTIONS,
@@ -57,11 +59,14 @@ from optimisation.benchmark import (
     latest_run_id,
     markdown_table,
     pipeline_totals,
-    query_history_for_run,
+    history_between,
+    match_history,
+    probes_to_df,
     run_benchmark,
+    run_io_probe,
     run_read_benchmark,
     summarise,
-    summarise_reads,
+    summarise_io,
     write_table,
 )
 from optimisation.builds import BASELINE_STEPS, PROD_NAMES, bench_names
@@ -691,55 +696,121 @@ print(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 5c. Files and bytes actually read (`system.query.history`)
+# MAGIC ### 5c. What do the timings say? (x1 run ae73c091, x10 run ccb0aacb, 2026-11-20)
 # MAGIC
-# MAGIC Wall-clock time on a fast query is noisy; **files read vs pruned** and **bytes read** are
-# MAGIC not. The system table fills with a delay: if `matched` is below `expected`, wait a few
-# MAGIC minutes and run this cell again (it only reads, nothing is re-timed).
+# MAGIC **Build cost (5a):**
+# MAGIC - `part_date` writes **604 files** (one per sales day): x1 16.3 s vs 2.7 s baseline (×6),
+# MAGIC   x10 15.8 s vs 5.6 s. Ranges don't overlap. Over-partitioning, measured.
+# MAGIC - Liquid clustering at x10: write 5.3 s + OPTIMIZE 4.0 s = 9.3 s → **4 files** instead of 1.
+# MAGIC   Z-order: write 5.6 s + OPTIMIZE 7.6 s = 13.2 s, also 4 files: clustering's OPTIMIZE is
+# MAGIC   about half as long as Z-order's here.
+# MAGIC - `lc_32mb` ended with the same 4 files as `lc_auto`: OPTIMIZE already produced ~35 MB files,
+# MAGIC   so the 32 MB target changed nothing at this size.
+# MAGIC - At x1 clustering costs ~4 s of OPTIMIZE and still leaves 1 file: pure cost, no layout gain.
 # MAGIC
-# MAGIC - `files_pruned` > 0 → data skipping worked at file level.
-# MAGIC - `read_mb` / `rows_read` lower with the same `files_read` → skipping of Parquet row
-# MAGIC   groups *inside* a file (sorted data helps there too).
-# MAGIC - `any_result_cache` must be 0, otherwise a timing came from a cache.
+# MAGIC **Read time (5b):** every query takes 0.5–0.8 s on the client, mostly fixed round-trip cost,
+# MAGIC so differences are small and mostly inside noise. The ones whose min–max ranges don't overlap:
+# MAGIC - x1: `part_date` is **slower** on the full scan (0.734 s vs 0.581 s): 604 files to open.
+# MAGIC - x10 `one_customer`: `lc_auto` 0.532 s and `zorder_32mb` 0.532 s vs baseline 0.624 s (−15 %).
+# MAGIC - x10 `all_by_country` (the control, no filter): `lc_auto` 0.657 s vs baseline 0.743 s.
+# MAGIC   Layout can't skip anything in a full scan, so this is most likely **parallelism**: 4 files
+# MAGIC   are read by more tasks than one 137 MB file. To be confirmed with the I/O numbers below.
+# MAGIC - x10 `month_by_country`: no difference beyond noise in wall-clock time.
+# MAGIC
+# MAGIC Client time can't show *how much was read*. That needs `system.query.history` (5d).
 
 # COMMAND ----------
 
-metrics = None
-for s, rid in READ_RUN_IDS.items():
-    h = query_history_for_run(spark, rid).withColumn("scale", F.lit(s))
-    metrics = h if metrics is None else metrics.unionByName(h)
+# MAGIC %md
+# MAGIC ### 5d. Files and bytes actually read (`system.query.history`)
+# MAGIC
+# MAGIC **First attempt matched 0 of 180.** Cause: the history table **redacts `statement_text`**
+# MAGIC unless you're an account admin, so the tag inside the SQL couldn't be searched. Fix:
+# MAGIC 1. **Query tags** (`SET QUERY_TAGS['bench'] = ...`) are stored in the unredacted `query_tags`
+# MAGIC    column. Documented for SQL warehouses; this cell checks if they work from a notebook.
+# MAGIC 2. **Time window** as a fallback: each probe query runs alone after a 3 s gap; the history row
+# MAGIC    that starts inside its window (and reads the most bytes) is ours.
+# MAGIC
+# MAGIC File and byte counts are deterministic, so one isolated execution per (variant, query) is
+# MAGIC enough: 2 scales × 5 variants × 3 queries = 30 probes, about 2 minutes.
+# MAGIC
+# MAGIC First, a look at what the history shows for your recent statements (is the text
+# MAGIC redacted? is `query_tags` there?).
 
-expected = len(LAYOUT_QUERIES) * (WARMUP + READ_REPS) * 5 * len(READ_RUN_IDS)
-matched = metrics.count()
-print(f"matched {matched} of {expected} executions in system.query.history")
+# COMMAND ----------
 
-if matched:
-    (
-        metrics.drop("statement_text")
-        .withColumn("captured_at", F.current_timestamp())
-        .write.mode("overwrite")
-        .option("overwriteSchema", "true")
-        .saveAsTable(BENCHMARK_QUERY_METRICS)
-    )
-    reads_io = spark.read.table(BENCHMARK_QUERY_METRICS)
-    rows = []
-    for s in READ_RUN_IDS:
-        for r in summarise_reads(reads_io.filter(F.col("scale") == s)).collect():
-            rows.append({"scale": s, **r.asDict()})
+hist_cols = spark.read.table("system.query.history").columns
+print("query_tags column present:", "query_tags" in hist_cols)
+recent = spark.sql(
+    "SELECT start_time, statement_type, left(statement_text, 60) AS text, produced_rows, read_files, "
+    + ("query_tags " if "query_tags" in hist_cols else "NULL AS query_tags ")
+    + "FROM system.query.history WHERE executed_by = current_user() ORDER BY start_time DESC LIMIT 8"
+)
+display(recent)
+
+# COMMAND ----------
+
+RUN_IO_PROBE = True
+
+if RUN_IO_PROBE:
+    probe_id = str(uuid.uuid4())  # one id for both scales
+    probe_records = []
+    for s, variants in layout.items():
+        probe_records += run_io_probe(spark, LAYOUT_QUERIES, variants, scale=s, probe_id=probe_id)
+    probes_to_df(spark, probe_records).write.mode("append").saveAsTable(BENCHMARK_IO_PROBES)
+
+probes = spark.read.table(BENCHMARK_IO_PROBES)
+last_probe = probes.orderBy(F.desc("started_at")).first().probe_id
+probes = probes.filter(F.col("probe_id") == last_probe)
+print(
+    "probe_id:",
+    last_probe,
+    "| probes:",
+    probes.count(),
+    "| query tags accepted:",
+    probes.agg(F.min("tags_set")).first()[0],
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC **Wait before running the next cell.** The history table usually takes a few minutes
+# MAGIC (up to an hour) to receive new rows. Re-run it until `matched` = 30; nothing is re-timed.
+# MAGIC
+# MAGIC Columns: `files_read` / `files_pruned` (file-level data skipping), `read_mb` / `rows_read`
+# MAGIC (also drop when Parquet row groups inside a file are skipped), `match_method` (tag or
+# MAGIC time window), `candidates` (history rows in the window; 1–2 is clean), `result_cache`
+# MAGIC (must be 0).
+
+# COMMAND ----------
+
+bounds = probes.agg(F.min("started_at").alias("a"), F.max("ended_at").alias("b")).first()
+matched_io = match_history(history_between(spark, bounds.a, bounds.b), probes)
+n_matched = matched_io.filter(F.col("match_method") != "none").count()
+print(f"matched {n_matched} of {probes.count()} probes")
+
+if n_matched:
+    matched_io.withColumn("captured_at", F.current_timestamp()).write.mode("overwrite").option(
+        "overwriteSchema", "true"
+    ).saveAsTable(BENCHMARK_QUERY_METRICS)
+    io_rows = [
+        r.asDict() for r in summarise_io(spark.read.table(BENCHMARK_QUERY_METRICS)).collect()
+    ]
     print(
         markdown_table(
-            rows,
+            io_rows,
             [
                 "scale",
                 "query",
                 "experiment",
-                "n",
+                "match_method",
+                "candidates",
                 "server_ms",
                 "files_read",
                 "files_pruned",
                 "read_mb",
                 "rows_read",
-                "any_result_cache",
+                "result_cache",
             ],
         )
     )

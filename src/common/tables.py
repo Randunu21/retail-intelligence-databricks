@@ -45,6 +45,8 @@ BENCH_SCHEMA = "bench"
 BENCHMARK_RUNS = fq(BENCH_SCHEMA, "benchmark_runs")
 # Per-execution I/O of read benchmarks, copied from system.query.history (files read/pruned).
 BENCHMARK_QUERY_METRICS = fq(BENCH_SCHEMA, "benchmark_query_metrics")
+# One isolated execution per (variant, query) with its time window and query tag.
+BENCHMARK_IO_PROBES = fq(BENCH_SCHEMA, "benchmark_io_probes")
 
 
 def bench_table(prefix: str, logical_name: str) -> str:

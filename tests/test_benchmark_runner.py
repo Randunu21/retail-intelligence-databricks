@@ -88,3 +88,24 @@ def test_run_read_benchmark_tags_and_counts(spark, local_delta):
     rows = {(r["experiment"], r["step"]): r["output_rows"] for r in recs}
     assert rows[("one", "read:by_k")] == 3 and rows[("two", "read:k0")] == 2
     assert all(r["layer"] == "read" for r in recs)
+
+
+def test_run_io_probe_records_windows_and_falls_back_without_tags(spark):
+    spark.range(6).withColumn("k", F.col("id") % 3).createOrReplaceTempView("io_fact")
+    slept = []
+    recs = bm.run_io_probe(
+        spark,
+        {"k0": "SELECT id FROM {table} WHERE k = 0"},
+        [bm.Variant("one", {"f": "io_fact"}), bm.Variant("two", {"f": "io_fact"})],
+        scale="x1",
+        table_step="f",
+        probe_id="fixed",
+        sleep=slept.append,
+        log=lambda m: None,
+    )
+    assert slept == [3.0, 3.0]  # a gap before every probe query
+    assert [r["experiment"] for r in recs] == ["one", "two"]
+    assert all(r["probe_id"] == "fixed" and r["result_rows"] == 2 for r in recs)
+    assert all(r["started_at"] <= r["ended_at"] for r in recs)
+    assert all(r["tags_set"] is False for r in recs)  # SET QUERY_TAGS doesn't exist locally
+    assert bm.probes_to_df(spark, recs).count() == 2

@@ -34,7 +34,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
 from optimisation.builds import BuildContext, BuildStep, check_step_order
@@ -434,7 +434,6 @@ def run_benchmark(
 # Read benchmarks: how fast are typical queries against each layout variant?
 # ----------------------------------------------------------------------------------------
 READ_PREFIX = "read:"
-_TAG_PATTERN = r"bench:([0-9a-f-]{36}):([A-Za-z0-9_]+):([A-Za-z0-9_]+):([0-9]+)"
 
 
 def query_tag(run_id: str, experiment: str, query: str, repetition: int) -> str:
@@ -444,10 +443,10 @@ def query_tag(run_id: str, experiment: str, query: str, repetition: int) -> str:
 def tagged_sql(sql: str, tag: str) -> str:
     """Wrap a query so its text carries a unique tag without changing its result.
 
-    The tag (1) makes every execution's SQL text unique, so no result cache can answer it,
-    and (2) lets us find this exact execution in `system.query.history` afterwards. It sits
-    in a string literal (always kept in the statement text) in a predicate that is always
-    true; the optimiser folds it away, so the plan is the same as the untagged query.
+    The tag makes every execution's SQL text unique, so no result cache can answer it. It
+    sits in a string literal in a predicate that is always true; the optimiser folds it
+    away, so the plan is the same as the untagged query. (It can't be used to FIND the
+    query in system.query.history: statement_text is redacted for non-admins.)
     """
     return f"SELECT * FROM (\n{sql.strip()}\n) WHERE '{tag}' <> ''"
 
@@ -499,64 +498,155 @@ def run_read_benchmark(
     return records
 
 
-QUERY_HISTORY_COLUMNS = [
+# ----------------------------------------------------------------------------------------
+# I/O probe: files read / pruned per query, from system.query.history
+#
+# The history table REDACTS statement_text for anyone who isn't an account admin, so a tag
+# inside the SQL can't be searched. Two ways to identify our executions instead:
+# 1. Query tags: `SET QUERY_TAGS['bench'] = '<tag>'` before each query. Tags are stored in
+#    the `query_tags` column, which isn't redacted.
+# 2. Time window: each probe query runs alone, with a gap before it, and we record when it
+#    started and ended. The history row that starts inside that window is our query.
+# Rows are ranked: a tag match wins; otherwise the candidate in the window that read the
+# most bytes (the SET statement itself reads nothing). File and byte counts are
+# deterministic, so one well-separated execution per (variant, query) is enough.
+# ----------------------------------------------------------------------------------------
+IO_PROBE_COLUMNS: list[tuple[str, str]] = [
+    ("probe_id", "STRING"),
+    ("scale", "STRING"),
+    ("experiment", "STRING"),
+    ("query", "STRING"),
+    ("tag", "STRING"),
+    ("table_name", "STRING"),
+    ("tags_set", "BOOLEAN"),
+    ("started_at", "TIMESTAMP"),
+    ("ended_at", "TIMESTAMP"),
+    ("result_rows", "BIGINT"),
+]
+IO_PROBE_SCHEMA = ", ".join(f"{n} {d}" for n, d in IO_PROBE_COLUMNS)
+HISTORY_COLUMNS = [
     "statement_id",
-    "statement_text",
     "start_time",
     "total_duration_ms",
     "read_files",
     "pruned_files",
     "read_bytes",
     "read_rows",
+    "produced_rows",
     "from_result_cache",
-    "read_io_cache_percent",
 ]
 
 
-def with_tag_columns(history: DataFrame) -> DataFrame:
-    """Parse run_id / experiment / query / repetition out of tagged statement texts."""
-    text = F.col("statement_text")
-    return (
-        history.withColumn("run_id", F.regexp_extract(text, _TAG_PATTERN, 1))
-        .withColumn("experiment", F.regexp_extract(text, _TAG_PATTERN, 2))
-        .withColumn("query", F.regexp_extract(text, _TAG_PATTERN, 3))
-        .withColumn("repetition", F.regexp_extract(text, _TAG_PATTERN, 4).cast("int"))
-        .filter(F.col("run_id") != "")
+def set_query_tag(spark: SparkSession, tag: str | None) -> bool:
+    """Set (or clear, with None) the session query tag `bench`. False if unsupported here."""
+    value = "UNSET" if tag is None else f"'{tag}'"
+    try:
+        spark.sql(f"SET QUERY_TAGS['bench'] = {value}").collect()
+        return True
+    except Exception:  # not available on this compute: fall back to time windows
+        return False
+
+
+def run_io_probe(
+    spark: SparkSession,
+    queries: Mapping[str, str],
+    variants: Sequence[Variant],
+    *,
+    scale: str,
+    table_step: str = "gold_fact_sales",
+    gap_s: float = 3.0,
+    probe_id: str | None = None,
+    log: Callable[[str], None] = print,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> list[dict[str, object]]:
+    """Run each (variant, query) once, isolated in time, and record its time window + tag.
+
+    Pass the same `probe_id` to several calls (e.g. one per scale) to group them.
+    """
+    probe_id = probe_id or str(uuid.uuid4())
+    records = []
+    for qname, sql in queries.items():
+        for v in variants:
+            table = v.names[table_step]
+            tag = query_tag(probe_id, v.experiment, qname, 0)
+            tags_set = set_query_tag(spark, tag)
+            sleep(gap_s)  # nothing else of ours runs in this gap
+            started = now()
+            rows = len(spark.sql(tagged_sql(sql.format(table=table), tag)).collect())
+            ended = now()
+            records.append({"probe_id": probe_id, "scale": scale, "experiment": v.experiment,
+                            "query": qname, "tag": tag, "table_name": table, "tags_set": tags_set,
+                            "started_at": started, "ended_at": ended, "result_rows": rows})  # fmt: skip
+            log(f"[{scale}] io-probe {qname:<18} {v.experiment:<12} rows={rows} tags={tags_set}")
+    set_query_tag(spark, None)
+    return records
+
+
+def probes_to_df(spark: SparkSession, records: Sequence[Mapping[str, object]]) -> DataFrame:
+    names = [n for n, _ in IO_PROBE_COLUMNS]
+    return spark.createDataFrame([tuple(r.get(n) for n in names) for r in records], IO_PROBE_SCHEMA)
+
+
+def history_between(spark: SparkSession, start: datetime, end: datetime) -> DataFrame:
+    """This user's statements in system.query.history between two times (+ query_tags if present)."""
+    cols = list(HISTORY_COLUMNS)
+    if "query_tags" in spark.read.table("system.query.history").columns:
+        cols.append("query_tags")
+    return spark.sql(
+        f"SELECT {', '.join(cols)} FROM system.query.history "
+        "WHERE executed_by = current_user() "
+        f"AND start_time BETWEEN TIMESTAMP'{start:%Y-%m-%d %H:%M:%S}' - INTERVAL 1 MINUTE "
+        f"AND TIMESTAMP'{end:%Y-%m-%d %H:%M:%S}' + INTERVAL 1 MINUTE"
     )
 
 
-def query_history_for_run(spark: SparkSession, run_id: str) -> DataFrame:
-    """Per-execution I/O metrics of one read benchmark run, from system.query.history.
+def match_history(history: DataFrame, probes: DataFrame, tolerance_s: float = 1.5) -> DataFrame:
+    """One history row per probe: tag match first, else the biggest read inside the window.
 
-    The system table is filled with a delay (usually a few minutes), so run this a little
-    after the benchmark. Only finished statements of this run are returned.
+    Adds `match_method` ("tag" | "time_window" | "none") and `candidates` (history rows in
+    the window; more than ~2 means the window wasn't clean and the row deserves a look).
     """
-    cols = ", ".join(QUERY_HISTORY_COLUMNS)
-    history = spark.sql(
-        f"SELECT {cols} FROM system.query.history "
-        f"WHERE statement_text LIKE '%bench:{run_id}:%' AND execution_status = 'FINISHED' "
-        "AND start_time > current_timestamp() - INTERVAL 7 DAYS"
+    tol = int(tolerance_s * 1_000_000)
+    h = history.withColumn("_h_us", F.unix_micros("start_time"))
+    if "query_tags" in history.columns:
+        h = h.withColumn("_tag", F.col("query_tags").getItem("bench"))
+    else:
+        h = h.withColumn("_tag", F.lit(None).cast("string"))
+    p = probes.withColumn("_s", F.unix_micros("started_at")).withColumn(
+        "_e", F.unix_micros("ended_at")
     )
-    return with_tag_columns(history)
-
-
-def summarise_reads(history: DataFrame, warmup: int = 1) -> DataFrame:
-    """Median I/O per (experiment, query) over the measured (non-warm-up) executions.
-
-    files_read / files_pruned come from Delta data skipping (min/max statistics per file);
-    read_mb and rows_read also drop when Parquet row groups inside a file are skipped.
-    """
-    measured = history.filter(F.col("repetition") > warmup)
+    joined = p.join(h, (h["_h_us"] >= p["_s"] - tol) & (h["_h_us"] <= p["_e"] + tol), "left")
+    key = ["probe_id", "experiment", "query"]
+    tag_hit = F.coalesce(F.col("_tag") == F.col("tag"), F.lit(False))
+    w = Window.partitionBy(*key).orderBy(tag_hit.desc(), F.col("read_bytes").desc_nulls_last())
     return (
-        measured.groupBy("experiment", "query")
-        .agg(
-            F.count(F.lit(1)).alias("n"),
-            F.median("total_duration_ms").alias("server_ms"),
-            F.median("read_files").alias("files_read"),
-            F.median("pruned_files").alias("files_pruned"),
-            F.round(F.median("read_bytes") / (1024 * 1024), 2).alias("read_mb"),
-            F.median("read_rows").alias("rows_read"),
-            F.max(F.col("from_result_cache").cast("int")).alias("any_result_cache"),
+        joined.withColumn("_tag_hit", tag_hit)
+        .withColumn("candidates", F.count("statement_id").over(Window.partitionBy(*key)))
+        .withColumn("_rank", F.row_number().over(w))
+        .filter("_rank = 1")
+        .withColumn(
+            "match_method",
+            F.when(F.col("_tag_hit"), "tag")
+            .when(F.col("statement_id").isNotNull(), "time_window")
+            .otherwise("none"),
         )
-        .orderBy("query", "experiment")
+        .drop("_rank", "_tag_hit", "_tag", "_h_us", "_s", "_e")
     )
+
+
+def summarise_io(matched: DataFrame) -> DataFrame:
+    """Readable I/O table per (scale, query, experiment)."""
+    return matched.select(
+        "scale",
+        "query",
+        "experiment",
+        "match_method",
+        "candidates",
+        F.col("total_duration_ms").alias("server_ms"),
+        F.col("read_files").alias("files_read"),
+        F.col("pruned_files").alias("files_pruned"),
+        F.round(F.col("read_bytes") / (1024 * 1024), 2).alias("read_mb"),
+        F.col("read_rows").alias("rows_read"),
+        F.col("from_result_cache").cast("int").alias("result_cache"),
+    ).orderBy("scale", "query", "experiment")

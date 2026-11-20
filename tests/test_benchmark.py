@@ -210,31 +210,54 @@ def test_tagged_sql_keeps_result_and_carries_tag(spark):
     assert sorted(r.a for r in spark.sql(q).collect()) == [1, 2]
 
 
-def test_with_tag_columns_parses_and_drops_untagged(spark):
-    from optimisation.benchmark import query_tag, tagged_sql, with_tag_columns
-
-    run = "39753a7e-fba8-4f8c-8117-72605897c2b9"
-    texts = [tagged_sql("SELECT 1", query_tag(run, "part_date", "month_by_country", 2)),
-             "SELECT 1"]  # fmt: skip
-    df = with_tag_columns(spark.createDataFrame([(t,) for t in texts], "statement_text STRING"))
-    rows = df.collect()
-    assert len(rows) == 1
-    assert (rows[0].run_id, rows[0].experiment, rows[0].query, rows[0].repetition) == (
-        run, "part_date", "month_by_country", 2)  # fmt: skip
-
-
-def test_summarise_reads_skips_warmup(spark):
-    from optimisation.benchmark import summarise_reads
-
-    schema = ("experiment STRING, query STRING, repetition INT, total_duration_ms BIGINT, "
+def _history(spark, rows):
+    schema = ("statement_id STRING, start_time TIMESTAMP, total_duration_ms BIGINT, "
               "read_files BIGINT, pruned_files BIGINT, read_bytes BIGINT, read_rows BIGINT, "
-              "from_result_cache BOOLEAN")  # fmt: skip
-    rows = [
-        ("lc", "q", 1, 900, 9, 0, 9 * 2**20, 900, False),  # warm-up, ignored
-        ("lc", "q", 2, 100, 1, 8, 2**20, 100, False),
-        ("lc", "q", 3, 120, 1, 8, 2**20, 100, False),
-        ("lc", "q", 4, 110, 1, 8, 2**20, 100, False),
-    ]
-    out = summarise_reads(spark.createDataFrame(rows, schema)).first()
-    assert (out.n, out.server_ms, out.files_read, out.files_pruned) == (3, 110, 1, 8)
-    assert out.read_mb == 1.0 and out.any_result_cache == 0
+              "produced_rows BIGINT, from_result_cache BOOLEAN, query_tags MAP<STRING, STRING>")  # fmt: skip
+    return spark.createDataFrame(rows, schema)
+
+
+def _probes(spark):
+    from optimisation.benchmark import probes_to_df
+
+    def p(exp, s, e, tag):
+        return {"probe_id": "p1", "scale": "x10", "experiment": exp, "query": "q", "tag": tag,
+                "table_name": "t", "tags_set": True, "started_at": s, "ended_at": e,
+                "result_rows": 22}  # fmt: skip
+
+    t = lambda sec: datetime(2026, 11, 20, 10, 0, sec, tzinfo=UTC)  # noqa: E731
+    return probes_to_df(spark, [p("a", t(3), t(4), "tagA"), p("b", t(10), t(11), "tagB"),
+                                p("c", t(20), t(21), "tagC")])  # fmt: skip
+
+
+def test_match_history_prefers_tag_then_biggest_read_in_window(spark):
+    from optimisation.benchmark import match_history
+
+    t = lambda sec, us=0: datetime(2026, 11, 20, 10, 0, sec, us, tzinfo=UTC)  # noqa: E731
+    hist = _history(spark, [
+        ("set_a", t(2, 900000), 5, 0, 0, 0, 0, 0, False, {"bench": "tagA"}),   # SET, in window
+        ("q_a", t(3, 100000), 300, 1, 3, 5000, 100, 22, False, {"bench": "tagA"}),
+        ("q_b", t(10, 50000), 280, 4, 0, 90000, 900, 22, False, None),         # no tags
+        ("set_b", t(9, 800000), 5, 0, 0, 0, 0, 0, False, None),
+        ("other", t(15), 10, 9, 9, 999999, 9, 9, False, None),                  # outside all
+    ])  # fmt: skip
+    m = {r.experiment: r for r in match_history(hist, _probes(spark)).collect()}
+    assert (m["a"].statement_id, m["a"].match_method) == ("q_a", "tag")
+    assert (m["b"].statement_id, m["b"].match_method, m["b"].candidates) == (
+        "q_b",
+        "time_window",
+        2,
+    )
+    assert (m["c"].statement_id, m["c"].match_method, m["c"].candidates) == (None, "none", 0)
+
+
+def test_match_history_without_query_tags_column(spark):
+    from optimisation.benchmark import match_history, summarise_io
+
+    t = lambda sec: datetime(2026, 11, 20, 10, 0, sec, tzinfo=UTC)  # noqa: E731
+    hist = _history(spark, [("q_a", t(3), 300, 1, 3, 2 * 2**20, 100, 22, False, None)]).drop(
+        "query_tags"
+    )
+    out = {r.experiment: r for r in summarise_io(match_history(hist, _probes(spark))).collect()}
+    assert out["a"].match_method == "time_window"
+    assert (out["a"].files_read, out["a"].files_pruned, out["a"].read_mb) == (1, 3, 2.0)

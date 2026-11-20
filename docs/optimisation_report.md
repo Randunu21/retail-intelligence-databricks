@@ -10,7 +10,7 @@
 |---|---|
 | Platform | Databricks Free Edition, serverless notebooks (Spark `<<SPARK_VERSION>>`) |
 | Data (x1, real) | UCI Online Retail II: Bronze 1,067,371 rows → Silver sales 1,003,357 / returns 17,915 |
-| Data (x10, synthetic) | `<<X10_BRONZE_ROWS>>` Bronze rows: the real data replicated 10× with shifted customer/invoice keys (see §3). Labelled synthetic everywhere it's used. |
+| Data (x10, synthetic) | 10,673,710 Bronze rows: the real data replicated 10× with shifted customer/invoice keys (see §3). Labelled synthetic everywhere it's used. |
 | What is timed | Rebuild of each Silver/Gold table with the pipeline's own code (`CREATE OR REPLACE`), wall clock on the driver |
 | Runs per measurement | 1 warm-up (discarded) + 5 measured at x1, 3 at x10; median reported |
 | Noise rule | A change counts only if the min–max ranges of before and after don't overlap |
@@ -68,7 +68,9 @@ this size. `silver_returns` (17,915 rows, 3.231 s) re-runs the full Bronze stagi
   duplicates. Products, prices, dates, countries and data-quality issues are unchanged.
 - Check: Silver/fact rows exactly 10× x1, customers 10 × 5,852 + Unknown, products/dates/
   monthly/cohort tables unchanged, revenue exactly 10× (196,438,616.370 vs 19,643,861.637): **all 11 checks passed**.
-- Limits: no new behaviour (same patterns with relabelled keys). Every x10 figure is labelled
+- Limits: no new behaviour (same patterns with relabelled keys). Bronze x10 is 1 file of
+  7.71 MB vs 5.61 MB at x1: repeated values compress extremely well in Parquet, so the replica
+  understates Bronze scan cost. Downstream tables grow normally (Silver sales 6.22 → 78.47 MB). Every x10 figure is labelled
   "synthetic x10 replica" and shown next to the x1 figure.
 
 Baseline at x10: run `39753a7e-fba8-4f8c-8117-72605897c2b9`, 2026-11-20, 1 warm-up + 3 measured runs.
@@ -100,21 +102,56 @@ x10, so no query against it can skip files with the default layout.
 Variants (`optimisation.layout`): `baseline` (defaults), `part_date` (PARTITIONED BY date_key),
 `zorder_32mb` (OPTIMIZE ZORDER BY date_key, customer_key; 32 MB target files), `lc_auto`
 (CLUSTER BY date_key, customer_key + OPTIMIZE), `lc_32mb` (same, 32 MB target files).
-Same data in every variant: `<<LAYOUT_FINGERPRINT>>`.
+Same data in every variant: **yes, all 10 (variant × scale) fingerprints match their baseline**.
 
-**Build cost** (write + OPTIMIZE):
+**Build cost** (write + OPTIMIZE; median of 3 after 1 warm-up):
 
-| Scale | Variant | Write s | OPTIMIZE s | Total s | Files | MB |
+| Scale | Variant | Write s (min–max) | OPTIMIZE s | Total s | Files | MB |
 |---|---|---:|---:|---:|---:|---:|
-| `<<from notebook §5a>>` | | | | | | |
+| x1 | baseline | 2.723 (2.603–3.340) | – | 2.723 | 1 | 12.37 |
+| x1 | part_date | 16.273 (15.689–18.338) | – | 16.273 | 604 | 16.03 |
+| x1 | zorder_32mb | 2.599 (2.517–2.760) | 1.214 | 3.813 | 1 | 12.37 |
+| x1 | lc_auto | 3.674 (3.670–4.365) | 4.116 | 7.790 | 1 | 12.56 |
+| x1 | lc_32mb | 3.700 (3.427–3.866) | 3.878 | 7.578 | 1 | 12.56 |
+| x10 | baseline | 5.551 (5.526–5.586) | – | 5.551 | 1 | 136.84 |
+| x10 | part_date | 15.832 (14.627–16.573) | – | 15.832 | 604 | 130.60 |
+| x10 | zorder_32mb | 5.603 (5.576–5.649) | 7.621 | 13.224 | 4 | 136.85 |
+| x10 | lc_auto | 5.300 (5.196–5.434) | 3.990 | 9.290 | 4 | 141.97 |
+| x10 | lc_32mb | 5.143 (5.132–5.493) | 3.867 | 9.010 | 4 | 141.89 |
 
-**Read cost** (median of 5; files/bytes from `system.query.history`):
+**Read time on the client** (median of 5 after 1 warm-up, s; min–max in brackets):
 
-| Scale | Query | Variant | Client s | Server ms | Files read | Files pruned | MB read |
-|---|---|---|---:|---:|---:|---:|---:|
-| `<<from notebook §5b–5c>>` | | | | | | | |
+| Scale | Query | baseline | part_date | zorder_32mb | lc_auto | lc_32mb |
+|---|---|---:|---:|---:|---:|---:|
+| x1 | month_by_country | 0.591 (0.552–0.694) | 0.644 (0.593–0.779) | 0.615 (0.599–0.702) | 0.604 (0.565–0.678) | 0.610 (0.583–0.610) |
+| x1 | one_customer | 0.599 (0.503–0.650) | 0.682 (0.608–0.790) | 0.554 (0.520–0.622) | 0.581 (0.547–0.609) | 0.554 (0.541–0.621) |
+| x1 | all_by_country | 0.581 (0.572–0.659) | **0.734** (0.704–0.746) | 0.588 (0.572–0.645) | 0.617 (0.567–0.666) | 0.602 (0.565–0.622) |
+| x10 | month_by_country | 0.658 (0.636–0.699) | 0.638 (0.596–0.841) | 0.666 (0.632–0.730) | 0.674 (0.658–0.680) | 0.694 (0.645–0.718) |
+| x10 | one_customer | 0.624 (0.583–0.678) | 0.638 (0.602–0.664) | **0.532** (0.510–0.579) | **0.532** (0.508–0.560) | 0.568 (0.528–0.599) |
+| x10 | all_by_country | 0.743 (0.728–0.811) | 0.697 (0.692–0.888) | 0.663 (0.639–0.712) | **0.657** (0.625–0.701) | 0.651 (0.638–0.734) |
 
-**Conclusion:** `<<>>`
+Bold = min–max range doesn't overlap the baseline's. Read runs: x1 `ae73c091-f77b-4509-b1bb-bb5a8f415236`,
+x10 `ccb0aacb-3122-45c1-a9a5-89b115dc5bba`. Result rows identical across variants (22 / 84 / 43).
+
+**Files and bytes read** (one isolated execution each, from `system.query.history`):
+
+| Scale | Query | Variant | Files read | Files pruned | MB read | Server ms |
+|---|---|---|---:|---:|---:|---:|
+| `<<from notebook §5d>>` | | | | | | |
+
+**Findings so far:**
+- Over-partitioning is clearly harmful: 604 files, build ×6 slower at x1 (16.3 s vs 2.7 s)
+  and ×2.9 at x10, and the x1 full scan is slower (0.734 s vs 0.581 s, ranges don't overlap).
+- Liquid clustering at x10 costs 5.3 s write + 4.0 s OPTIMIZE (vs 5.6 s baseline) and turns
+  one 137 MB file into 4; Z-order's OPTIMIZE took 7.6 s for the same 4 files.
+- `lc_32mb` = `lc_auto` (4 files each): the 32 MB target made no difference at this size.
+- At x1 clustering adds ~4 s OPTIMIZE and still leaves 1 file: no possible read gain.
+- Client-side read times are 0.5–0.8 s and mostly fixed round-trip cost. Beyond noise at x10:
+  `one_customer` −15 % with clustering / Z-order (0.532 vs 0.624 s); and the no-filter control
+  `all_by_country` −12 % with `lc_auto` (0.657 vs 0.743 s), which layout can't explain by
+  skipping, most likely more parallel scan tasks over 4 files than over 1. `<<confirm with I/O>>`
+
+**Conclusion:** `<<after I/O numbers>>`
 
 ### 4.2 Summary of all changes
 
