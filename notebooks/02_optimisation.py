@@ -60,6 +60,7 @@ from optimisation.benchmark import (
     markdown_table,
     pipeline_totals,
     history_between,
+    history_diagnosis,
     match_history,
     probes_to_df,
     run_benchmark,
@@ -724,12 +725,14 @@ print(
 # MAGIC %md
 # MAGIC ### 5d. Files and bytes actually read (`system.query.history`)
 # MAGIC
-# MAGIC **First attempt matched 0 of 180.** Cause: the history table **redacts `statement_text`**
-# MAGIC unless you're an account admin, so the tag inside the SQL couldn't be searched. Fix:
-# MAGIC 1. **Query tags** (`SET QUERY_TAGS['bench'] = ...`) are stored in the unredacted `query_tags`
-# MAGIC    column. Documented for SQL warehouses; this cell checks if they work from a notebook.
-# MAGIC 2. **Time window** as a fallback: each probe query runs alone after a 3 s gap; the history row
-# MAGIC    that starts inside its window (and reads the most bytes) is ours.
+# MAGIC **First attempt matched 0 of 180.** Cause (seen in the history table below): for queries
+# MAGIC sent from a notebook over Spark Connect, `statement_text` holds the **Python line** that
+# MAGIC ran the query (`writer.createOrReplace()`, `spark.sql(f"OPTIMIZE {table}").collect()`),
+# MAGIC not the SQL. The tag inside the SQL string never reaches the history. Fix:
+# MAGIC 1. **Query tags** (`SET QUERY_TAGS['bench'] = ...`): every following statement carries the
+# MAGIC    tag in the `query_tags` column. A tag match is accepted at any time.
+# MAGIC 2. **Time window** as a fallback: each probe query runs alone after a 3 s gap; the history
+# MAGIC    row that starts inside its window (and reads the most bytes) is ours.
 # MAGIC
 # MAGIC File and byte counts are deterministic, so one isolated execution per (variant, query) is
 # MAGIC enough: 2 scales × 5 variants × 3 queries = 30 probes, about 2 minutes.
@@ -785,9 +788,19 @@ print(
 # COMMAND ----------
 
 bounds = probes.agg(F.min("started_at").alias("a"), F.max("ended_at").alias("b")).first()
-matched_io = match_history(history_between(spark, bounds.a, bounds.b), probes)
+history = history_between(spark, bounds.a, bounds.b)
+matched_io = match_history(history, probes)
 n_matched = matched_io.filter(F.col("match_method") != "none").count()
 print(f"matched {n_matched} of {probes.count()} probes")
+if n_matched < probes.count():
+    # Not everything matched: is the history simply behind, or are tags missing?
+    for k, v in history_diagnosis(history, probes).items():
+        print(f"  {k}: {v}")
+    print(
+        "  -> history_caught_up = False: wait and re-run this cell (ingestion can take up to 1 h)."
+    )
+    print("  -> caught up but history_rows_with_bench_tag = 0: tags don't reach the history from")
+    print("     notebooks; the time-window fallback is then the only match method.")
 
 if n_matched:
     matched_io.withColumn("captured_at", F.current_timestamp()).write.mode("overwrite").option(

@@ -446,7 +446,8 @@ def tagged_sql(sql: str, tag: str) -> str:
     The tag makes every execution's SQL text unique, so no result cache can answer it. It
     sits in a string literal in a predicate that is always true; the optimiser folds it
     away, so the plan is the same as the untagged query. (It can't be used to FIND the
-    query in system.query.history: statement_text is redacted for non-admins.)
+    query in system.query.history: from a notebook, statement_text holds the Python line
+    that ran the query, not the SQL.)
     """
     return f"SELECT * FROM (\n{sql.strip()}\n) WHERE '{tag}' <> ''"
 
@@ -501,15 +502,18 @@ def run_read_benchmark(
 # ----------------------------------------------------------------------------------------
 # I/O probe: files read / pruned per query, from system.query.history
 #
-# The history table REDACTS statement_text for anyone who isn't an account admin, so a tag
-# inside the SQL can't be searched. Two ways to identify our executions instead:
-# 1. Query tags: `SET QUERY_TAGS['bench'] = '<tag>'` before each query. Tags are stored in
-#    the `query_tags` column, which isn't redacted.
-# 2. Time window: each probe query runs alone, with a gap before it, and we record when it
-#    started and ended. The history row that starts inside that window is our query.
-# Rows are ranked: a tag match wins; otherwise the candidate in the window that read the
-# most bytes (the SET statement itself reads nothing). File and byte counts are
-# deterministic, so one well-separated execution per (variant, query) is enough.
+# For queries sent from a notebook over Spark Connect, `statement_text` holds the PYTHON
+# line that triggered the query (e.g. "writer.createOrReplace()"), not the SQL, so a tag
+# hidden inside the SQL can't be searched for. (For non-admins it is also redacted.) Two
+# ways to identify our executions instead:
+# 1. Query tags: `SET QUERY_TAGS['bench'] = '<tag>'` before each query. Every following
+#    statement in the session carries the tag in the `query_tags` column. A tag match is
+#    accepted at any time (no dependency on clocks).
+# 2. Time window (fallback, when tags aren't available): each probe query runs alone, with a
+#    gap before it; the history row that starts inside its [start, end] window is ours.
+# Among candidates, a tag match wins, then the row that read the most bytes (the SET
+# statement and metadata calls read nothing). File and byte counts are deterministic, so
+# one well-separated execution per (variant, query) is enough.
 # ----------------------------------------------------------------------------------------
 IO_PROBE_COLUMNS: list[tuple[str, str]] = [
     ("probe_id", "STRING"),
@@ -588,24 +592,29 @@ def probes_to_df(spark: SparkSession, records: Sequence[Mapping[str, object]]) -
     return spark.createDataFrame([tuple(r.get(n) for n in names) for r in records], IO_PROBE_SCHEMA)
 
 
-def history_between(spark: SparkSession, start: datetime, end: datetime) -> DataFrame:
-    """This user's statements in system.query.history between two times (+ query_tags if present)."""
+def history_between(
+    spark: SparkSession, start: datetime, end: datetime, margin_min: int = 15
+) -> DataFrame:
+    """This user's statements around [start, end] (wide margin: tag matches don't need tight
+    times). Includes query_tags if the column exists."""
     cols = list(HISTORY_COLUMNS)
     if "query_tags" in spark.read.table("system.query.history").columns:
         cols.append("query_tags")
     return spark.sql(
         f"SELECT {', '.join(cols)} FROM system.query.history "
         "WHERE executed_by = current_user() "
-        f"AND start_time BETWEEN TIMESTAMP'{start:%Y-%m-%d %H:%M:%S}' - INTERVAL 1 MINUTE "
-        f"AND TIMESTAMP'{end:%Y-%m-%d %H:%M:%S}' + INTERVAL 1 MINUTE"
+        f"AND start_time BETWEEN TIMESTAMP'{start:%Y-%m-%d %H:%M:%S}' - INTERVAL {margin_min} MINUTES "
+        f"AND TIMESTAMP'{end:%Y-%m-%d %H:%M:%S}' + INTERVAL {margin_min} MINUTES"
     )
 
 
 def match_history(history: DataFrame, probes: DataFrame, tolerance_s: float = 1.5) -> DataFrame:
-    """One history row per probe: tag match first, else the biggest read inside the window.
+    """One history row per probe: a query-tag match (any time), else the biggest read
+    that started inside the probe's own time window.
 
-    Adds `match_method` ("tag" | "time_window" | "none") and `candidates` (history rows in
-    the window; more than ~2 means the window wasn't clean and the row deserves a look).
+    Adds `match_method` ("tag" | "time_window" | "none") and `candidates` (history rows that
+    matched by tag or window; the SET statement and metadata calls add a few, so 1–4 is
+    normal).
     """
     tol = int(tolerance_s * 1_000_000)
     h = history.withColumn("_h_us", F.unix_micros("start_time"))
@@ -616,8 +625,9 @@ def match_history(history: DataFrame, probes: DataFrame, tolerance_s: float = 1.
     p = probes.withColumn("_s", F.unix_micros("started_at")).withColumn(
         "_e", F.unix_micros("ended_at")
     )
-    joined = p.join(h, (h["_h_us"] >= p["_s"] - tol) & (h["_h_us"] <= p["_e"] + tol), "left")
-    key = ["probe_id", "experiment", "query"]
+    in_window = (h["_h_us"] >= p["_s"] - tol) & (h["_h_us"] <= p["_e"] + tol)
+    joined = p.join(h, (h["_tag"] == p["tag"]) | in_window, "left")
+    key = ["probe_id", "experiment", "query", "scale"]
     tag_hit = F.coalesce(F.col("_tag") == F.col("tag"), F.lit(False))
     w = Window.partitionBy(*key).orderBy(tag_hit.desc(), F.col("read_bytes").desc_nulls_last())
     return (
@@ -633,6 +643,25 @@ def match_history(history: DataFrame, probes: DataFrame, tolerance_s: float = 1.
         )
         .drop("_rank", "_tag_hit", "_tag", "_h_us", "_s", "_e")
     )
+
+
+def history_diagnosis(history: DataFrame, probes: DataFrame) -> dict[str, object]:
+    """Why might nothing match? Compare what the history holds with the probe window."""
+    b = probes.agg(F.min("started_at").alias("a"), F.max("ended_at").alias("b")).first()
+    hrow = history.agg(F.count(F.lit(1)).alias("n"), F.max("start_time").alias("latest")).first()
+    tagged = (
+        history.filter(F.col("query_tags").getItem("bench").startswith("bench:")).count()
+        if "query_tags" in history.columns
+        else None
+    )
+    return {
+        "probe_first_start": b.a,
+        "probe_last_end": b.b,
+        "history_rows_in_range": hrow.n,
+        "history_latest_start": hrow.latest,
+        "history_rows_with_bench_tag": tagged,
+        "history_caught_up": hrow.latest is not None and hrow.latest >= b.b,
+    }
 
 
 def summarise_io(matched: DataFrame) -> DataFrame:

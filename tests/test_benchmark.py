@@ -240,6 +240,7 @@ def test_match_history_prefers_tag_then_biggest_read_in_window(spark):
         ("q_b", t(10, 50000), 280, 4, 0, 90000, 900, 22, False, None),         # no tags
         ("set_b", t(9, 800000), 5, 0, 0, 0, 0, 0, False, None),
         ("other", t(15), 10, 9, 9, 999999, 9, 9, False, None),                  # outside all
+        ("q_c", t(40), 300, 2, 2, 7000, 50, 22, False, {"bench": "tagC"}),      # tag, late clock
     ])  # fmt: skip
     m = {r.experiment: r for r in match_history(hist, _probes(spark)).collect()}
     assert (m["a"].statement_id, m["a"].match_method) == ("q_a", "tag")
@@ -248,7 +249,8 @@ def test_match_history_prefers_tag_then_biggest_read_in_window(spark):
         "time_window",
         2,
     )
-    assert (m["c"].statement_id, m["c"].match_method, m["c"].candidates) == (None, "none", 0)
+    # tag match accepted even though the history clock puts it 19 s after the probe window
+    assert (m["c"].statement_id, m["c"].match_method) == ("q_c", "tag")
 
 
 def test_match_history_without_query_tags_column(spark):
@@ -261,3 +263,15 @@ def test_match_history_without_query_tags_column(spark):
     out = {r.experiment: r for r in summarise_io(match_history(hist, _probes(spark))).collect()}
     assert out["a"].match_method == "time_window"
     assert (out["a"].files_read, out["a"].files_pruned, out["a"].read_mb) == (1, 3, 2.0)
+
+
+def test_match_history_none_when_nothing_matches(spark):
+    from optimisation.benchmark import history_diagnosis, match_history
+
+    t = lambda sec: datetime(2026, 11, 20, 10, 0, sec, tzinfo=UTC)  # noqa: E731
+    hist = _history(spark, [("old", t(0), 5, 1, 0, 10, 1, 1, False, None)])
+    m = match_history(hist, _probes(spark)).collect()
+    assert {r.match_method for r in m} == {"none"}
+    d = history_diagnosis(hist, _probes(spark))
+    assert d["history_rows_in_range"] == 1 and d["history_rows_with_bench_tag"] == 0
+    assert d["history_caught_up"] is False  # latest history row is before the probes ended
