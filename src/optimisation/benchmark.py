@@ -541,6 +541,12 @@ HISTORY_COLUMNS = [
 ]
 
 
+def io_probe_tag(probe_id: str, scale: str, experiment: str, query: str) -> str:
+    """Unique per probe execution. Scale is part of it: one probe_id covers several scales,
+    and without it the x1 and x10 runs of the same query would share a tag."""
+    return f"bench:{probe_id}:{scale}:{experiment}:{query}"
+
+
 def set_query_tag(spark: SparkSession, tag: str | None) -> bool:
     """Set (or clear, with None) the session query tag `bench`. False if unsupported here."""
     value = "UNSET" if tag is None else f"'{tag}'"
@@ -573,7 +579,7 @@ def run_io_probe(
     for qname, sql in queries.items():
         for v in variants:
             table = v.names[table_step]
-            tag = query_tag(probe_id, v.experiment, qname, 0)
+            tag = io_probe_tag(probe_id, scale, v.experiment, qname)
             tags_set = set_query_tag(spark, tag)
             sleep(gap_s)  # nothing else of ours runs in this gap
             started = now()
@@ -616,6 +622,9 @@ def match_history(history: DataFrame, probes: DataFrame, tolerance_s: float = 1.
     matched by tag or window; the SET statement and metadata calls add a few, so 1–4 is
     normal).
     """
+    dupes = probes.groupBy("tag").count().filter("count > 1").count()
+    if dupes:
+        raise ValueError(f"{dupes} tag(s) shared by several probes: matches would be ambiguous")
     tol = int(tolerance_s * 1_000_000)
     h = history.withColumn("_h_us", F.unix_micros("start_time"))
     if "query_tags" in history.columns:

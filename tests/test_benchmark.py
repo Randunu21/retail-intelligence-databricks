@@ -275,3 +275,15 @@ def test_match_history_none_when_nothing_matches(spark):
     d = history_diagnosis(hist, _probes(spark))
     assert d["history_rows_in_range"] == 1 and d["history_rows_with_bench_tag"] == 0
     assert d["history_caught_up"] is False  # latest history row is before the probes ended
+
+
+def test_match_history_rejects_duplicate_tags(spark):
+    from optimisation.benchmark import match_history, probes_to_df
+
+    t = datetime(2026, 11, 20, 10, 0, 0, tzinfo=UTC)
+    rec = {"probe_id": "p", "scale": "x1", "experiment": "a", "query": "q", "tag": "same",
+           "table_name": "t", "tags_set": True, "started_at": t, "ended_at": t, "result_rows": 1}  # fmt: skip
+    probes = probes_to_df(spark, [rec, {**rec, "scale": "x10"}])
+    hist = _history(spark, [("s", t, 1, 1, 0, 1, 1, 1, False, {"bench": "same"})])
+    with pytest.raises(ValueError, match="shared"):
+        match_history(hist, probes)

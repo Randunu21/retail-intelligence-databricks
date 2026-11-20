@@ -133,32 +133,66 @@ Same data in every variant: **yes, all 10 (variant × scale) fingerprints match 
 Bold = min–max range doesn't overlap the baseline's. Read runs: x1 `ae73c091-f77b-4509-b1bb-bb5a8f415236`,
 x10 `ccb0aacb-3122-45c1-a9a5-89b115dc5bba`. Result rows identical across variants (22 / 84 / 43).
 
-**Files and bytes read** (one isolated execution each, from `system.query.history`):
+**Files and bytes read, x10** (one isolated execution each, from `system.query.history`, all
+30 matched by query tag; probe `71e0e4b4-6d5f-4abc-b066-57a432f9b994`, 2026-11-20; no result cache):
 
-| Scale | Query | Variant | Files read | Files pruned | MB read | Server ms |
-|---|---|---|---:|---:|---:|---:|
-| `<<from notebook §5d>>` | | | | | | |
+| Query | Variant | Files read | Files pruned | MB read | vs baseline | Server ms |
+|---|---|---:|---:|---:|---:|---:|
+| month_by_country | baseline | 1 | 0 | 16.58 | – | 411 |
+| month_by_country | part_date | 26 | 578 | 6.48 | −61 % | 403 |
+| month_by_country | zorder_32mb | 2 | 2 | 7.36 | −56 % | 445 |
+| month_by_country | lc_auto | 2 | 2 | 10.31 | −38 % | 409 |
+| month_by_country | lc_32mb | 2 | 2 | 9.92 | −40 % | 404 |
+| one_customer | baseline | 1 | 0 | 52.82 | – | 350 |
+| one_customer | part_date | 602 | 2 | 115.42 | **+119 %** | 416 |
+| one_customer | zorder_32mb | 2 | 2 | 24.71 | −53 % | 287 |
+| one_customer | lc_auto | 2 | 2 | 23.04 | −56 % | 297 |
+| one_customer | lc_32mb | 2 | 2 | 29.21 | −45 % | 281 |
+| all_by_country (control) | baseline | 1 | 0 | 16.44 | – | 512 |
+| all_by_country (control) | part_date | 604 | 0 | 115.56 | **+603 %** | 493 |
+| all_by_country (control) | zorder_32mb | 4 | 0 | 15.83 | −4 % | 433 |
+| all_by_country (control) | lc_auto | 4 | 0 | 15.81 | −4 % | 494 |
+| all_by_country (control) | lc_32mb | 4 | 0 | 15.81 | −4 % | 428 |
 
-**Findings so far:**
-- Over-partitioning is clearly harmful: 604 files, build ×6 slower at x1 (16.3 s vs 2.7 s)
-  and ×2.9 at x10, and the x1 full scan is slower (0.734 s vs 0.581 s, ranges don't overlap).
-- Liquid clustering at x10 costs 5.3 s write + 4.0 s OPTIMIZE (vs 5.6 s baseline) and turns
-  one 137 MB file into 4; Z-order's OPTIMIZE took 7.6 s for the same 4 files.
-- `lc_32mb` = `lc_auto` (4 files each): the 32 MB target made no difference at this size.
-- At x1 clustering adds ~4 s OPTIMIZE and still leaves 1 file: no possible read gain.
-- Client-side read times are 0.5–0.8 s and mostly fixed round-trip cost. Beyond noise at x10:
-  `one_customer` −15 % with clustering / Z-order (0.532 vs 0.624 s); and the no-filter control
-  `all_by_country` −12 % with `lc_auto` (0.657 vs 0.743 s), which layout can't explain by
-  skipping, most likely more parallel scan tasks over 4 files than over 1. `<<confirm with I/O>>`
+x1 I/O: `<<x1 re-probe pending>>`. The first x1 probe shared its tags with x10 (bug, fixed:
+tags now include the scale, and duplicate tags raise an error), so its x1 rows were copies of
+x10 and were discarded.
 
-**Conclusion:** `<<after I/O numbers>>`
+`rows_read` is not reported: the history counts rows *after* the scan's filter (84 for the
+customer lookup in every layout), so it says nothing about skipping. `one_customer` reads more
+MB than the full scan because it needs 6 columns (incl. text columns) instead of 2. Server ms is a
+single sample per cell: indicative only.
+
+**Findings:**
+- **Data skipping works with clustering and Z-order.** At x10 the fact table has 4 files after
+  OPTIMIZE; the month filter and the customer filter each skip 2 of them. Bytes read drop
+  38–40 % (month) and 45–56 % (customer) with liquid clustering, 56 % / 53 % with Z-order.
+- **Partitioning by day wins only on its own key**: the month report reads 26 of 604 files
+  (−61 % bytes), but every other query pays: the customer lookup reads 602 files and +119 % bytes,
+  the full scan +603 % bytes (tiny files: per-file overhead, nearly whole files read). Plus a
+  ×2.9 slower build at x10 and ×6 at x1. Rejected.
+- **The control query (no filter) skips nothing in any layout**, as it should. Bytes are the same
+  ±4 %, so the faster client time seen for `lc_auto` there is not less I/O; more files read in
+  parallel is consistent with it but not proven by single server samples.
+- **Bytes fell, time barely moved:** server time is 280–450 ms in every layout (−15–20 % for
+  the customer lookup with clustering). At ~140 MB the query is dominated by fixed costs; the
+  byte savings are what matter as the table grows.
+- **Z-order vs liquid clustering:** Z-order read a bit less for the month query (7.36 vs ~10 MB)
+  but its OPTIMIZE took 7.6 s vs 4.0 s, it rewrites the table every time, and its keys aren't
+  stored with the table. Liquid clustering is incremental and the keys can change later.
+
+**Conclusion:** cluster `fact_sales` by `(date_key, customer_key)` with liquid clustering
+(default file size; 32 MB made no difference). It halves bytes for customer lookups and cuts
+~40 % for date-range reports at x10, for ~4 s of OPTIMIZE. Don't partition: ~600 daily
+partitions on a 10–140 MB table cost far more than they save. At x1 (1 file) no gain is possible;
+in the pipeline the cost is small enough to keep for when the table grows (decided in step 2.6).
 
 ### 4.2 Summary of all changes
 
 | # | Change | Why | Metric | Before | After | % change | Beyond noise? |
 |---|---|---|---|---:|---:|---:|---|
-| 1 | Liquid clustering on `(date_key, customer_key)` + `OPTIMIZE` | | | | | | |
-| 2 | Partitioning by `date_key` (compared) | | | | | | |
+| 1 | Liquid clustering on `(date_key, customer_key)` + `OPTIMIZE` (x10) | Data skipping for date and customer filters | MB read: month / customer query | 16.58 / 52.82 | 10.31 / 23.04 | −38 % / −56 % | Deterministic I/O counts (single execution) |
+| 2 | Partitioning by `date_key` (compared, rejected) (x10) | Classic layout; tests over-partitioning | Build s; MB read customer / full scan | 5.551; 52.82 / 16.44 | 15.832; 115.42 / 115.56 | +185 %; +119 % / +603 % | Build: ranges don't overlap; I/O deterministic |
 | 3 | Broadcast hints for small dimensions | | | | | | |
 | 4 | Early projection / filtering, fewer shuffles | | | | | | |
 | 5 | Stage Silver once (instead of computing it twice) | | | | | | |

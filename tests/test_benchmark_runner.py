@@ -109,3 +109,16 @@ def test_run_io_probe_records_windows_and_falls_back_without_tags(spark):
     assert all(r["started_at"] <= r["ended_at"] for r in recs)
     assert all(r["tags_set"] is False for r in recs)  # SET QUERY_TAGS doesn't exist locally
     assert bm.probes_to_df(spark, recs).count() == 2
+    assert recs[0]["tag"] == "bench:fixed:x1:one:k0"
+
+
+def test_io_probe_tags_unique_across_scales(spark):
+    """Regression: one probe_id over two scales must not give x1 and x10 the same tag."""
+    spark.range(3).withColumn("k", F.lit(0)).createOrReplaceTempView("io_fact2")
+    v = [bm.Variant("one", {"f": "io_fact2"})]
+    q = {"k0": "SELECT id FROM {table} WHERE k = 0"}
+    recs = []
+    for scale in ("x1", "x10"):
+        recs += bm.run_io_probe(spark, q, v, scale=scale, table_step="f", probe_id="same",
+                                sleep=lambda s: None, log=lambda m: None)  # fmt: skip
+    assert len({r["tag"] for r in recs}) == 2
