@@ -40,7 +40,7 @@ from common.tables import (
     SILVER_SALES,
     bench_table,
 )
-from optimisation.pipeline_sql import load_query
+from optimisation.pipeline_sql import load_query, retarget
 from transformations.gold import (
     build_customer_cohort_retention,
     build_dim_customer,
@@ -82,15 +82,32 @@ class BuildContext:
     def read(self, logical: str) -> DataFrame:
         return self.spark.read.table(self.names[logical])
 
+    @property
+    def mapping(self) -> dict[str, str]:
+        """Production table name -> this context's table (for retargeting SQL)."""
+        return {PROD_NAMES[k]: v for k, v in self.names.items() if k in PROD_NAMES}
+
+    def query(self, file_name: str) -> str:
+        """A pipeline SQL file's query text, retargeted to this context's tables."""
+        return load_query(self.pipeline_dir, file_name, self.mapping)
+
     def sql_file(self, file_name: str) -> DataFrame:
         """Run a pipeline SQL file's query with production names swapped for `names`."""
-        mapping = {PROD_NAMES[k]: v for k, v in self.names.items() if k in PROD_NAMES}
-        return self.spark.sql(load_query(self.pipeline_dir, file_name, mapping))
+        return self.spark.sql(self.query(file_name))
+
+    def sql_text(self, sql: str) -> DataFrame:
+        """Run SQL written with PRODUCTION table names (e.g. an optimised variant of a
+        pipeline query), retargeted to this context's tables."""
+        return self.spark.sql(retarget(sql, self.mapping))
 
 
 @dataclass(frozen=True)
 class BuildStep:
-    """One table build. `build(ctx)` returns the DataFrame; the harness writes and times it."""
+    """One table build. `build(ctx)` returns the DataFrame; the harness writes and times it.
+
+    A build may also write its own output(s) and return None (e.g. one step that produces
+    silver_sales AND silver_returns); the harness then only times it.
+    """
 
     name: str  # logical name of the OUTPUT table, also the step's name in benchmark_runs
     layer: str  # "silver" | "gold"

@@ -70,9 +70,18 @@ from optimisation.benchmark import (
     summarise_io,
     write_table,
 )
-from optimisation.builds import BASELINE_STEPS, PROD_NAMES, bench_names
+from optimisation.builds import BASELINE_STEPS, PROD_NAMES, BuildContext, bench_names
+from optimisation.compute import (
+    GOLD_JOIN_STEPS,
+    SILVER_COMBINED_STEPS,
+    gold_variants,
+    plan_summary,
+    plan_text,
+    silver_variants,
+)
 from optimisation.layout import FACT_STEP, LAYOUT_QUERIES, layout_variants
 from optimisation.scaling import expected_rows, replicate_bronze
+from transformations.silver import stage_silver
 
 spark.sql(
     f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{BENCH_SCHEMA} "
@@ -827,3 +836,193 @@ if n_matched:
             ],
         )
     )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5e. Layout result (x1 + x10 I/O, 2026-11-20)
+# MAGIC
+# MAGIC - **x1:** every non-partitioned variant is 1 file → nothing to skip, same bytes (1.77 MB full
+# MAGIC   scan). `part_date` reads 604 files and **9×** the bytes for the full scan (16.03 MB), 3.6×
+# MAGIC   for the customer lookup; only the month query reads less (1.19 vs 1.77 MB).
+# MAGIC - **x10:** clustering / Z-order skip 2 of 4 files for both filtered queries: month −40 to −48 %
+# MAGIC   bytes, customer −45 to −56 % (ranges over two probes). `part_date`: month −61 %, but customer
+# MAGIC   +119 % and full scan +603 % bytes.
+# MAGIC - File counts were identical in both probes; MB read varied up to ~20 % between probes.
+# MAGIC - **Decision:** liquid clustering on `(date_key, customer_key)`, no partitioning (step 2.6).
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6. Compute: shuffles, joins, and an alternative to caching
+# MAGIC
+# MAGIC ### Caching on serverless
+# MAGIC The probe (§1) showed `df.cache()` is *accepted* but `CACHE TABLE` is not. Accepted isn't the
+# MAGIC same as useful, so we measure it. The alternatives when reuse matters:
+# MAGIC - **Materialise the intermediate as a Delta table** (`staged_table` below): survives the
+# MAGIC   session, can be reused by other jobs, costs one extra write.
+# MAGIC - **Restructure so the result is computed once** (one query producing both outputs).
+# MAGIC - Rely on the **disk (IO) cache**: serverless keeps recently read Parquet on local SSD
+# MAGIC   automatically; repeated reads of the same table are already faster (that's why we warm up).
+# MAGIC
+# MAGIC ### 6a. Silver: prepare Bronze once instead of twice
+# MAGIC One combined step writes `silver_sales` **and** `silver_returns`, timed together, in four ways
+# MAGIC (`optimisation.compute`): `baseline` (staging computed twice, like the pipeline),
+# MAGIC `staged_table` (staging written once to Delta), `cached` (staging `cache()`d once),
+# MAGIC `agg_dedup` (de-dup by GROUP BY instead of a window). Run interleaved at x1 and x10.
+# MAGIC At x10: 4 variants × 4 runs × ~45 s ≈ 12 minutes.
+
+# COMMAND ----------
+
+# Does cache() do anything here? storageLevel / is_cached show what the session reports.
+probe_df = stage_silver(spark.read.table(BRONZE_TRANSACTIONS)).cache()
+print("is_cached:", probe_df.is_cached, "| storageLevel:", probe_df.storageLevel)
+probe_df.unpersist()
+
+# COMMAND ----------
+
+RUN_SILVER_COMPUTE = True
+SILVER_SCALES = {"x1": (BRONZE_TRANSACTIONS, baseline_x1), SCALE: (BRONZE_XN, baseline_xn)}
+silver_vs = {s: silver_variants(bronze, s) for s, (bronze, _) in SILVER_SCALES.items()}
+
+if RUN_SILVER_COMPUTE:
+    for s, variants in silver_vs.items():
+        run_benchmark(
+            spark,
+            SILVER_COMBINED_STEPS,
+            variants,
+            scale=s,
+            pipeline_dir=PIPELINE_DIR,
+            repetitions=3,
+            warmup=WARMUP,
+            runs_table=BENCHMARK_RUNS,
+        )
+
+# COMMAND ----------
+
+all_runs = spark.read.table(BENCHMARK_RUNS)
+silver_rows = []
+for s, variants in silver_vs.items():
+    base = SILVER_SCALES[s][1]
+    ref = {
+        t: fingerprint(spark.read.table(base.names[t])).first()
+        for t in ("silver_sales", "silver_returns")
+    }
+    rid = latest_run_id(all_runs, "agg_dedup", s, layer="silver")
+    summ = summarise(all_runs.filter(F.col("run_id") == rid))
+    stats = {r.experiment: r for r in summ.collect()}
+    b = stats["baseline"]
+    for v in variants:
+        r = stats[v.experiment]
+        overlap = r.min_s <= b.max_s and b.min_s <= r.max_s
+        silver_rows.append(
+            {
+                "scale": s,
+                "experiment": v.experiment,
+                "median_s": r.median_s,
+                "range": f"{r.min_s}-{r.max_s}",
+                "pct_vs_base": round((r.median_s - b.median_s) / b.median_s * 100, 1),
+                "beyond_noise": not overlap if v.experiment != "baseline" else "-",
+                "same_data": all(
+                    fingerprint(spark.read.table(v.names[t])).first() == ref[t] for t in ref
+                ),
+            }
+        )
+print(
+    markdown_table(
+        silver_rows,
+        ["scale", "experiment", "median_s", "range", "pct_vs_base", "beyond_noise", "same_data"],
+    )
+)
+assert all(r["same_data"] for r in silver_rows), "A Silver variant changed the data"
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6b. Gold joins: which strategy does Spark pick?
+# MAGIC
+# MAGIC Before timing, read the plans. `plan_summary` counts join types, shuffles (Exchange) and
+# MAGIC broadcasts in each query's physical plan at x10. With AQE the plan can still change at
+# MAGIC run time (`AdaptiveSparkPlan isFinalPlan=false`); the query profile shows the final one (2.7).
+# MAGIC Variants: `baseline` (optimiser decides), `broadcast` (BROADCAST hints), `no_broadcast`
+# MAGIC (MERGE hints: what auto-broadcast saves), `rewrite` (aggregate before joining / drop a join).
+
+# COMMAND ----------
+
+GOLD_SCALES = {"x1": baseline_x1, SCALE: baseline_xn}
+gold_vs = {s: gold_variants(base.names, s) for s, base in GOLD_SCALES.items()}
+steps_by_name = {s.name: s for s in BASELINE_STEPS}
+
+plans = []
+for v in gold_vs[SCALE]:
+    ctx = BuildContext(spark, v.names, PIPELINE_DIR)
+    for step in GOLD_JOIN_STEPS:
+        df = v.step_overrides.get(step, steps_by_name[step].build)(ctx)
+        plans.append({"step": step, "experiment": v.experiment, **plan_summary(plan_text(df))})
+print(markdown_table(plans, ["step", "experiment", "joins", "shuffles", "broadcasts"]))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6c. Gold joins: timing (x1 and x10)
+# MAGIC 4 variants × 4 steps × 4 runs per scale, interleaved; ~5 minutes per scale.
+
+# COMMAND ----------
+
+RUN_GOLD_COMPUTE = True
+
+if RUN_GOLD_COMPUTE:
+    for s, variants in gold_vs.items():
+        run_benchmark(
+            spark,
+            BASELINE_STEPS,
+            variants,
+            scale=s,
+            pipeline_dir=PIPELINE_DIR,
+            repetitions=3,
+            warmup=WARMUP,
+            only_steps=list(GOLD_JOIN_STEPS),
+            runs_table=BENCHMARK_RUNS,
+        )
+
+all_runs = spark.read.table(BENCHMARK_RUNS)
+gold_rows = []
+for s, variants in gold_vs.items():
+    base = GOLD_SCALES[s]
+    rid = latest_run_id(all_runs, "no_broadcast", s, layer="gold")
+    summ = summarise(all_runs.filter(F.col("run_id") == rid))
+    stats = {(r.step, r.experiment): r for r in summ.collect()}
+    for step in GOLD_JOIN_STEPS:
+        ref = fingerprint(spark.read.table(base.names[step])).first()
+        b = stats[(step, "baseline")]
+        for v in variants:
+            r = stats[(step, v.experiment)]
+            overlap = r.min_s <= b.max_s and b.min_s <= r.max_s
+            gold_rows.append(
+                {
+                    "scale": s,
+                    "step": step,
+                    "experiment": v.experiment,
+                    "median_s": r.median_s,
+                    "range": f"{r.min_s}-{r.max_s}",
+                    "pct_vs_base": round((r.median_s - b.median_s) / b.median_s * 100, 1),
+                    "beyond_noise": not overlap if v.experiment != "baseline" else "-",
+                    "same_data": fingerprint(spark.read.table(v.names[step])).first() == ref,
+                }
+            )
+print(
+    markdown_table(
+        gold_rows,
+        [
+            "scale",
+            "step",
+            "experiment",
+            "median_s",
+            "range",
+            "pct_vs_base",
+            "beyond_noise",
+            "same_data",
+        ],
+    )
+)
+assert all(r["same_data"] for r in gold_rows), "A Gold variant changed the data"

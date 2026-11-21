@@ -311,6 +311,12 @@ def markdown_table(rows: Sequence[Mapping[str, object]], columns: Sequence[str])
 # ----------------------------------------------------------------------------------------
 # Delta / Databricks side (not unit-tested locally: needs Delta tables)
 # ----------------------------------------------------------------------------------------
+def _materialise(df: DataFrame | None, table: str, spec: WriteSpec) -> None:
+    """Write the step's DataFrame; None means the step already wrote its own tables."""
+    if df is not None:
+        write_table(df, table, spec)
+
+
 def write_table(df: DataFrame, table: str, spec: WriteSpec) -> None:
     """CREATE OR REPLACE the table from `df` with the layout in `spec` (DataFrameWriterV2)."""
     writer = df.writeTo(table).using("delta")
@@ -403,7 +409,7 @@ def run_benchmark(
                 target = v.names[step.name]
                 spec = v.spec_for(step.name)
                 t = repeat_timed(
-                    lambda b=build, c=ctx, tg=target, s=spec: write_table(b(c), tg, s), 1, 0
+                    lambda b=build, c=ctx, tg=target, s=spec: _materialise(b(c), tg, s), 1, 0
                 )[0]
                 writes[v.experiment].append(Timing(rep, rep <= warmup, t.seconds, t.started_at))
                 msg = f"[{scale}] {step.name:<32} {v.experiment:<24} rep {rep}: {t.seconds:7.2f}s"

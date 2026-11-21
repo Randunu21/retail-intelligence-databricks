@@ -133,40 +133,43 @@ Same data in every variant: **yes, all 10 (variant × scale) fingerprints match 
 Bold = min–max range doesn't overlap the baseline's. Read runs: x1 `ae73c091-f77b-4509-b1bb-bb5a8f415236`,
 x10 `ccb0aacb-3122-45c1-a9a5-89b115dc5bba`. Result rows identical across variants (22 / 84 / 43).
 
-**Files and bytes read, x10** (one isolated execution each, from `system.query.history`, all
-30 matched by query tag; probe `71e0e4b4-6d5f-4abc-b066-57a432f9b994`, 2026-11-20; no result cache):
+**Files and bytes read** (one isolated execution per cell, from `system.query.history`, all
+matched by query tag, no result cache). x10 was probed twice (probe 1: `71e0e4b4…`, probe 2 with
+scale-unique tags); file counts were identical in both, MB read varied up to ~20 %, so x10 MB
+is shown as probe 1 / probe 2. x1 is from probe 2 only (probe 1's x1 rows were x10 copies due to
+the tag bug, discarded).
 
-| Query | Variant | Files read | Files pruned | MB read | vs baseline | Server ms |
+| Query | Variant | x1 files read / pruned | x1 MB | x10 files read / pruned | x10 MB (p1 / p2) | x10 vs baseline |
 |---|---|---:|---:|---:|---:|---:|
-| month_by_country | baseline | 1 | 0 | 16.58 | – | 411 |
-| month_by_country | part_date | 26 | 578 | 6.48 | −61 % | 403 |
-| month_by_country | zorder_32mb | 2 | 2 | 7.36 | −56 % | 445 |
-| month_by_country | lc_auto | 2 | 2 | 10.31 | −38 % | 409 |
-| month_by_country | lc_32mb | 2 | 2 | 9.92 | −40 % | 404 |
-| one_customer | baseline | 1 | 0 | 52.82 | – | 350 |
-| one_customer | part_date | 602 | 2 | 115.42 | **+119 %** | 416 |
-| one_customer | zorder_32mb | 2 | 2 | 24.71 | −53 % | 287 |
-| one_customer | lc_auto | 2 | 2 | 23.04 | −56 % | 297 |
-| one_customer | lc_32mb | 2 | 2 | 29.21 | −45 % | 281 |
-| all_by_country (control) | baseline | 1 | 0 | 16.44 | – | 512 |
-| all_by_country (control) | part_date | 604 | 0 | 115.56 | **+603 %** | 493 |
-| all_by_country (control) | zorder_32mb | 4 | 0 | 15.83 | −4 % | 433 |
-| all_by_country (control) | lc_auto | 4 | 0 | 15.81 | −4 % | 494 |
-| all_by_country (control) | lc_32mb | 4 | 0 | 15.81 | −4 % | 428 |
+| month_by_country | baseline | 1 / 0 | 1.77 | 1 / 0 | 16.58 / 16.58 | – |
+| month_by_country | part_date | 26 / 578 | 1.19 | 26 / 578 | 6.48 / 6.48 | −61 % |
+| month_by_country | zorder_32mb | 1 / 0 | 1.77 | 2 / 2 | 7.36 / 8.63 | −48 to −56 % |
+| month_by_country | lc_auto | 1 / 0 | 1.80 | 2 / 2 | 10.31 / 9.94 | −38 to −40 % |
+| month_by_country | lc_32mb | 1 / 0 | 1.80 | 2 / 2 | 9.92 / 9.87 | −40 % |
+| one_customer | baseline | 1 / 0 | 4.45 | 1 / 0 | 52.82 / 52.82 | – |
+| one_customer | part_date | 602 / 2 | 16.00 | 602 / 2 | 115.42 / 115.42 | **+119 %** |
+| one_customer | zorder_32mb | 1 / 0 | 4.45 | 2 / 2 | 24.71 / 29.19 | −45 to −53 % |
+| one_customer | lc_auto | 1 / 0 | 4.58 | 2 / 2 | 23.04 / 26.08 | −51 to −56 % |
+| one_customer | lc_32mb | 1 / 0 | 4.58 | 2 / 2 | 29.21 / 27.34 | −45 to −48 % |
+| all_by_country (control) | baseline | 1 / 0 | 1.77 | 1 / 0 | 16.44 / 16.44 | – |
+| all_by_country (control) | part_date | 604 / 0 | 16.03 | 604 / 0 | 115.56 / 115.56 | **+603 %** |
+| all_by_country (control) | zorder_32mb | 1 / 0 | 1.77 | 4 / 0 | 15.83 / 15.83 | −4 % |
+| all_by_country (control) | lc_auto | 1 / 0 | 1.77 | 4 / 0 | 15.81 / 15.82 | −4 % |
+| all_by_country (control) | lc_32mb | 1 / 0 | 1.77 | 4 / 0 | 15.81 / 15.81 | −4 % |
 
-x1 I/O: `<<x1 re-probe pending>>`. The first x1 probe shared its tags with x10 (bug, fixed:
-tags now include the scale, and duplicate tags raise an error), so its x1 rows were copies of
-x10 and were discarded.
+Server time (single samples, indicative): x1 270–400 ms, x10 280–510 ms in every layout; the
+customer lookup with clustering/Z-order was 281–297 ms vs 322–350 ms baseline in both probes.
 
 `rows_read` is not reported: the history counts rows *after* the scan's filter (84 for the
 customer lookup in every layout), so it says nothing about skipping. `one_customer` reads more
-MB than the full scan because it needs 6 columns (incl. text columns) instead of 2. Server ms is a
-single sample per cell: indicative only.
+MB than the full scan because it needs 6 columns (incl. text columns) instead of 2.
 
 **Findings:**
-- **Data skipping works with clustering and Z-order.** At x10 the fact table has 4 files after
+- **x1: nothing to skip.** Every non-partitioned layout is 1 file and reads the same bytes;
+  partitioning reads 604 files and 9× the bytes for a full scan (16.03 vs 1.77 MB).
+- **x10: data skipping works with clustering and Z-order.** The fact table has 4 files after
   OPTIMIZE; the month filter and the customer filter each skip 2 of them. Bytes read drop
-  38–40 % (month) and 45–56 % (customer) with liquid clustering, 56 % / 53 % with Z-order.
+  38–40 % (month) and 45–56 % (customer) with liquid clustering, 48–56 % / 45–53 % with Z-order.
 - **Partitioning by day wins only on its own key**: the month report reads 26 of 604 files
   (−61 % bytes), but every other query pays: the customer lookup reads 602 files and +119 % bytes,
   the full scan +603 % bytes (tiny files: per-file overhead, nearly whole files read). Plus a
@@ -177,7 +180,7 @@ single sample per cell: indicative only.
 - **Bytes fell, time barely moved:** server time is 280–450 ms in every layout (−15–20 % for
   the customer lookup with clustering). At ~140 MB the query is dominated by fixed costs; the
   byte savings are what matter as the table grows.
-- **Z-order vs liquid clustering:** Z-order read a bit less for the month query (7.36 vs ~10 MB)
+- **Z-order vs liquid clustering:** Z-order read a bit less for the month query (7.4–8.6 vs ~10 MB)
   but its OPTIMIZE took 7.6 s vs 4.0 s, it rewrites the table every time, and its keys aren't
   stored with the table. Liquid clustering is incremental and the keys can change later.
 
@@ -193,9 +196,9 @@ in the pipeline the cost is small enough to keep for when the table grows (decid
 |---|---|---|---|---:|---:|---:|---|
 | 1 | Liquid clustering on `(date_key, customer_key)` + `OPTIMIZE` (x10) | Data skipping for date and customer filters | MB read: month / customer query | 16.58 / 52.82 | 10.31 / 23.04 | −38 % / −56 % | Deterministic I/O counts (single execution) |
 | 2 | Partitioning by `date_key` (compared, rejected) (x10) | Classic layout; tests over-partitioning | Build s; MB read customer / full scan | 5.551; 52.82 / 16.44 | 15.832; 115.42 / 115.56 | +185 %; +119 % / +603 % | Build: ranges don't overlap; I/O deterministic |
-| 3 | Broadcast hints for small dimensions | | | | | | |
-| 4 | Early projection / filtering, fewer shuffles | | | | | | |
-| 5 | Stage Silver once (instead of computing it twice) | | | | | | |
+| 3 | Broadcast hints for small dimensions (and MERGE hints to price auto-broadcast) | | Gold join steps s | `<<>>` | | | |
+| 4 | Fewer wide operations: pre-aggregate before join (daily), drop a join (monthly), GROUP BY de-dup in Silver | | s | `<<>>` | | | |
+| 5 | Stage Silver once: Delta table vs `cache()` | | Silver (sales + returns) s | `<<>>` | | | |
 | 6 | Incremental `MERGE` + CDF instead of full rebuild | | | | | | |
 
 ## 5. Evidence

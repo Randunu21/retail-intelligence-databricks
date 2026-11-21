@@ -138,7 +138,9 @@ COHORT_RETENTION_COLUMNS: list[str] = [
 ]
 
 
-def build_customer_cohort_retention(fact_sales: DataFrame, dim_customer: DataFrame) -> DataFrame:
+def build_customer_cohort_retention(
+    fact_sales: DataFrame, dim_customer: DataFrame, join_hint: str | None = None
+) -> DataFrame:
     """Cohort retention grid: first-purchase month x months since first purchase.
 
     - Cohort = all known customers whose FIRST purchase was in that month
@@ -148,14 +150,18 @@ def build_customer_cohort_retention(fact_sales: DataFrame, dim_customer: DataFra
     - The grid is COMPLETE: every cohort gets a row for every month from 0 up to the last
       month in the data, with 0 active customers where nobody came back. Without this,
       missing cells would look like "no data" instead of "0 % retained" on a heatmap.
+
+    `join_hint` ("broadcast", "merge", ...) is only used by the Phase 2 benchmarks to force a
+    join strategy for the activity x cohorts join; the pipeline leaves it to the optimiser.
     """
     cohorts = dim_customer.filter(~F.col("is_unknown")).select("customer_key", "cohort_month")
+    joined_cohorts = cohorts.hint(join_hint) if join_hint else cohorts
     activity = (
         fact_sales.filter(F.col("customer_key") != UNKNOWN_CUSTOMER_KEY)
         .withColumn("activity_month", F.trunc(F.to_date("invoice_ts"), "month"))
         .groupBy("customer_key", "activity_month")
         .agg(F.sum("line_revenue").alias("revenue"))
-        .join(cohorts, "customer_key")
+        .join(joined_cohorts, "customer_key")
         .withColumn(
             "months_since_first_purchase",
             F.months_between("activity_month", "cohort_month").cast("int"),
