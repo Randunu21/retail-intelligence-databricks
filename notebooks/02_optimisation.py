@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # 02 · Pipeline optimisation, measured
 # MAGIC
@@ -881,6 +885,14 @@ probe_df.unpersist()
 
 # COMMAND ----------
 
+# The session may hold an older optimisation.benchmark from before the file was last
+# edited (a plain import reuses it); reload so the current harness measures this run.
+import importlib
+
+import optimisation.benchmark
+importlib.reload(optimisation.benchmark)
+from optimisation.benchmark import run_benchmark
+
 RUN_SILVER_COMPUTE = True
 SILVER_SCALES = {"x1": (BRONZE_TRANSACTIONS, baseline_x1), SCALE: (BRONZE_XN, baseline_xn)}
 silver_vs = {s: silver_variants(bronze, s) for s, (bronze, _) in SILVER_SCALES.items()}
@@ -949,6 +961,23 @@ assert all(r["same_data"] for r in silver_rows), "A Silver variant changed the d
 
 # COMMAND ----------
 
+# The session may hold older copies of the project modules from before they were last
+# edited (a plain import reuses them); reload in dependency order and re-bind what
+# this cell uses.
+import importlib
+
+import optimisation.builds
+importlib.reload(optimisation.builds)
+from optimisation.builds import BASELINE_STEPS, BuildContext
+
+# compute imports from transformations.gold: reload that first so compute picks up
+# the current build functions (e.g. build_customer_cohort_retention's join_hint).
+import transformations.gold
+importlib.reload(transformations.gold)
+import optimisation.compute
+importlib.reload(optimisation.compute)
+from optimisation.compute import GOLD_JOIN_STEPS, gold_variants, plan_summary, plan_text
+
 GOLD_SCALES = {"x1": baseline_x1, SCALE: baseline_xn}
 gold_vs = {s: gold_variants(base.names, s) for s, base in GOLD_SCALES.items()}
 steps_by_name = {s.name: s for s in BASELINE_STEPS}
@@ -968,6 +997,17 @@ print(markdown_table(plans, ["step", "experiment", "joins", "shuffles", "broadca
 # MAGIC 4 variants × 4 steps × 4 runs per scale, interleaved; ~5 minutes per scale.
 
 # COMMAND ----------
+
+# The session can hold older module bindings after src/ edits; reload in dependency
+# order so run_benchmark constructs contexts with the current BuildContext
+# (benchmark imports it from builds, which imports from transformations.gold).
+import importlib
+
+import optimisation.builds
+importlib.reload(optimisation.builds)
+import optimisation.benchmark
+importlib.reload(optimisation.benchmark)
+from optimisation.benchmark import run_benchmark
 
 RUN_GOLD_COMPUTE = True
 
@@ -1026,3 +1066,8 @@ print(
     )
 )
 assert all(r["same_data"] for r in gold_rows), "A Gold variant changed the data"
+
+# COMMAND ----------
+
+v = gold_vs[SCALE][0]  # baseline
+print(plan_text(BuildContext(spark, v.names, PIPELINE_DIR).sql_file("gold_monthly_country_sales.sql")))
