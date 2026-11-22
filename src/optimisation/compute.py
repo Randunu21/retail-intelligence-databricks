@@ -285,7 +285,8 @@ def gold_variants(base_names: Mapping[str, str], scale: str) -> list[Variant]:
 # ----------------------------------------------------------------------------------------
 # Plan inspection (evidence for "which join / how many shuffles")
 # ----------------------------------------------------------------------------------------
-_NODE = re.compile(r"^\(\d+\) ([A-Za-z]+)", flags=re.MULTILINE)
+# One block per numbered node in the formatted plan's details: "(7) Name ...body...".
+_NODE_BLOCK = re.compile(r"^\((\d+)\) (\w+)(.*?)(?=^\(\d+\) |\Z)", flags=re.MULTILINE | re.DOTALL)
 _JOIN_TYPES = ("BroadcastHashJoin", "SortMergeJoin", "ShuffledHashJoin",
                "BroadcastNestedLoopJoin", "CartesianProduct")  # fmt: skip
 
@@ -299,26 +300,35 @@ def plan_text(df: DataFrame) -> str:
 
 
 def plan_summary(plan: str) -> dict[str, object]:
-    """Count join strategies, shuffles and broadcasts in a formatted plan.
+    """Count join strategies, shuffles and broadcasts in a formatted physical plan.
 
-    Uses the numbered node details ("(7) SortMergeJoin"), so each node counts once.
-    Photon names (PhotonBroadcastHashJoin, PhotonShuffleExchangeSink/Source) are mapped
-    to the same categories; a Photon shuffle is counted once (its Sink).
+    Each numbered node's details block is read once. Data movement is named differently by
+    the two engines:
+    - classic Spark: `Exchange` (a shuffle) and `BroadcastExchange` (a broadcast);
+    - Photon (serverless): every movement is a Sink -> `PhotonShuffleMapStage` -> Source
+      triple, and the MapStage's arguments say what it is: `EXECUTOR_BROADCAST` = a
+      broadcast, anything else (e.g. `ENSURE_REQUIREMENTS`) = a shuffle. Counting the
+      MapStage counts each movement once.
+    `runtime_filter`: a broadcast build side also prunes the big side's scan at run time
+    (`hashedrelationcontains(...)` in OptionalDataFilters), a free bonus of broadcasting.
     """
-    nodes = _NODE.findall(plan)
-    joins = Counter(j for n in nodes for j in _JOIN_TYPES if n.endswith(j))
-    shuffles = sum(
-        1
-        for n in nodes
-        if "Exchange" in n
-        and "Broadcast" not in n
-        and not n.endswith("Source")
-        and not n.startswith("Reused")
-    )
-    broadcasts = sum(1 for n in nodes if "BroadcastExchange" in n and not n.endswith("Source"))
+    joins: Counter[str] = Counter()
+    shuffles = broadcasts = 0
+    for _, name, body in _NODE_BLOCK.findall(plan):
+        joins.update(j for j in _JOIN_TYPES if name.endswith(j))
+        if name == "PhotonShuffleMapStage":
+            if "EXECUTOR_BROADCAST" in body:
+                broadcasts += 1
+            else:
+                shuffles += 1
+        elif name == "BroadcastExchange":
+            broadcasts += 1
+        elif name in ("Exchange", "ShuffleExchange"):
+            shuffles += 1
     return {
         "joins": ", ".join(f"{k}×{v}" for k, v in sorted(joins.items())) or "-",
         "shuffles": shuffles,
         "broadcasts": broadcasts,
+        "runtime_filter": "hashedrelationcontains" in plan,
         "adaptive": "AdaptiveSparkPlan" in plan,
     }

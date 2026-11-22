@@ -153,10 +153,48 @@ def test_plan_summary_sees_join_strategy(spark):
     assert smj["broadcasts"] == 0
 
 
-def test_plan_summary_counts_photon_names_once():
-    plan = "\n".join([
-        "(1) PhotonScan", "(2) PhotonShuffleExchangeSink", "(3) PhotonShuffleExchangeSource",
-        "(4) PhotonBroadcastExchange", "(5) PhotonBroadcastHashJoin", "(6) ReusedExchange",
-    ])  # fmt: skip
-    s = compute.plan_summary(plan)
-    assert (s["joins"], s["shuffles"], s["broadcasts"]) == ("BroadcastHashJoin×1", 1, 1)
+# Condensed from a real serverless plan (gold_monthly_country_sales, x10, 2026-11-22):
+# 1 broadcast (dim_date, EXECUTOR_BROADCAST) + 3 shuffles (ENSURE_REQUIREMENTS).
+PHOTON_PLAN = """== Physical Plan ==
+AdaptiveSparkPlan (26)
+
+(1) PhotonScan parquet retail.bench.x10_baseline__gold_fact_sales
+OptionalDataFilters: [hashedrelationcontains(date_key#475589)]
+
+(3) PhotonShuffleExchangeSink
+Arguments: SinglePartition
+
+(4) PhotonShuffleMapStage
+Arguments: EXECUTOR_BROADCAST, [id=#562344]
+
+(5) PhotonShuffleExchangeSource
+Arguments: false
+
+(6) PhotonBroadcastHashJoin
+Join type: Inner
+
+(10) PhotonShuffleExchangeSink
+Arguments: hashpartitioning(year_month#475604, 218)
+
+(11) PhotonShuffleMapStage
+Arguments: ENSURE_REQUIREMENTS, [id=#562358]
+
+(12) PhotonShuffleExchangeSource
+Arguments: false
+
+(16) PhotonShuffleMapStage
+Arguments: ENSURE_REQUIREMENTS, [id=#562366]
+
+(20) PhotonShuffleMapStage
+Arguments: ENSURE_REQUIREMENTS, [id=#562372]
+
+(26) AdaptiveSparkPlan
+Arguments: isFinalPlan=false
+"""
+
+
+def test_plan_summary_reads_photon_plan():
+    s = compute.plan_summary(PHOTON_PLAN)
+    assert s["joins"] == "BroadcastHashJoin×1"
+    assert (s["shuffles"], s["broadcasts"]) == (3, 1)
+    assert s["runtime_filter"] is True and s["adaptive"] is True

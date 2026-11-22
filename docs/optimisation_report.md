@@ -190,15 +190,75 @@ MB than the full scan because it needs 6 columns (incl. text columns) instead of
 partitions on a 10–140 MB table cost far more than they save. At x1 (1 file) no gain is possible;
 in the pipeline the cost is small enough to keep for when the table grows (decided in step 2.6).
 
-### 4.2 Summary of all changes
+### 4.2 Compute: shuffles, joins and an alternative to caching (step 2.4)
+
+All variants produce the same data as the baseline (fingerprint match on every table, both
+scales). 1 warm-up + 3 measured runs, interleaved; median (min–max).
+
+**Caching on serverless:** `CACHE TABLE` is rejected, but `df.cache()` works:
+`is_cached: True | storageLevel: Disk Serialized 1x Replicated`, i.e. serverless caches to local
+disk, not memory. A cache lives only in the notebook session; the pipeline can't share it.
+
+**Silver: sales + returns built together** (one combined step):
+
+| Variant | What changes | x1 s | x1 vs base | x10 s | x10 vs base |
+|---|---|---:|---:|---:|---:|
+| baseline | Bronze staging computed twice (as in the pipeline) | 8.581 (8.554–8.928) | – | 46.776 (46.431–46.923) | – |
+| staged_table | staging written once to Delta, both outputs read it | 9.459 (9.439–9.607) | **+10.2 %** | 37.245 (37.005–37.256) | **−20.4 %** |
+| cached | staging `cache()`d once | 9.573 (9.425–9.579) | **+11.6 %** | 36.501 (36.291–36.602) | **−22.0 %** |
+| agg_dedup | de-dup by GROUP BY instead of a window (still twice) | 8.010 (7.984–8.218) | **−6.7 %** | 43.726 (43.632–43.796) | **−6.5 %** |
+
+Bold = beyond noise (ranges don't overlap). Runs: 2026-11-21/22.
+
+- Computing the staging once saves ~10 s of 47 at x10, the largest single gain so far. At x1 the
+  extra write / cache costs more than the duplicated work it saves (+10–12 %).
+- `cached` beat `staged_table` by ~0.7 s at x10, but only exists inside a notebook session; the
+  pipeline equivalent is a stored intermediate (applied in step 2.6).
+- GROUP BY de-dup is a steady −6.5 to −6.7 % at both scales (no sort; partial aggregation before
+  the shuffle). Its combination with staging-once was not measured separately.
+
+**Gold join plans** (x10, `plan_summary` of each query's physical plan before execution):
+`<<re-run §6b with the fixed counter>>`. Join types from the first run (reliable):
+baseline = auto-broadcast for monthly (dim_date), product_performance and two cohort joins;
+daily_sales is a `ShuffledHashJoin` because dim_date is the preserved side of its LEFT JOIN.
+`broadcast` hints produced plans identical to the baseline; `MERGE` hints switched joins to
+`SortMergeJoin`. (The first run's shuffle/broadcast counts were wrong: the counter didn't know
+Photon's node names; fixed and tested against a real plan.)
+
+**Gold join timing** (median s; % vs baseline; bold = beyond noise):
+
+| Step | Scale | baseline | broadcast | no_broadcast | rewrite |
+|---|---|---:|---:|---:|---:|
+| daily_sales | x1 | 2.287 | 2.410 (+5.4 %) | 2.571 (**+12.4 %**) | 2.437 (**+6.6 %**) |
+| monthly_country_sales | x1 | 2.401 | 2.371 (−1.2 %) | 2.880 (**+20.0 %**) | 2.557 (+6.5 %) |
+| product_performance | x1 | 2.917 | 2.759 (−5.4 %) | 2.953 (+1.2 %) | 2.820 (−3.3 %)¹ |
+| cohort_retention | x1 | 2.614 | 2.711 (+3.7 %) | 3.028 (+15.8 %) | 2.753 (+5.3 %)¹ |
+| daily_sales | x10 | 3.889 | 3.739 (−3.9 %) | 5.355 (**+37.7 %**) | 2.868 (**−26.3 %**) |
+| monthly_country_sales | x10 | 3.958 | 3.946 (−0.3 %) | 5.959 (**+50.6 %**) | 3.035 (**−23.3 %**) |
+| product_performance | x10 | 3.960 | 3.940 (−0.5 %) | 4.272 (**+7.9 %**) | 3.875 (−2.1 %)¹ |
+| cohort_retention | x10 | 3.077 | 2.954 (−4.0 %) | 3.612 (**+17.4 %**) | 3.039 (−1.2 %)¹ |
+
+¹ no rewrite for this step: the baseline query re-run (a noise reference).
+
+- **Broadcast hints: no effect**, because the optimiser already broadcasts the small sides. The
+  daily_sales hint is ignored (the preserved side of a LEFT JOIN can't be broadcast).
+- **Forcing sort-merge joins costs +8 to +51 % at x10**: that is what automatic broadcasting
+  already saves.
+- **Rewrites are the Gold win at x10**: aggregating 10M fact rows to 739 days before the join
+  (−26.3 %), and taking year/month from `invoice_ts` instead of joining dim_date (−23.3 %). At x1
+  the daily rewrite is 6.6 % slower: the extra aggregation stage costs more than it saves.
+- Note: the monthly rewrite's `year_month` is nullable where the pipeline's (from dim_date) is
+  NOT NULL; values are identical.
+
+### 4.3 Summary of all changes
 
 | # | Change | Why | Metric | Before | After | % change | Beyond noise? |
 |---|---|---|---|---:|---:|---:|---|
 | 1 | Liquid clustering on `(date_key, customer_key)` + `OPTIMIZE` (x10) | Data skipping for date and customer filters | MB read: month / customer query | 16.58 / 52.82 | 10.31 / 23.04 | −38 % / −56 % | Deterministic I/O counts (single execution) |
 | 2 | Partitioning by `date_key` (compared, rejected) (x10) | Classic layout; tests over-partitioning | Build s; MB read customer / full scan | 5.551; 52.82 / 16.44 | 15.832; 115.42 / 115.56 | +185 %; +119 % / +603 % | Build: ranges don't overlap; I/O deterministic |
-| 3 | Broadcast hints for small dimensions (and MERGE hints to price auto-broadcast) | | Gold join steps s | `<<>>` | | | |
-| 4 | Fewer wide operations: pre-aggregate before join (daily), drop a join (monthly), GROUP BY de-dup in Silver | | s | `<<>>` | | | |
-| 5 | Stage Silver once: Delta table vs `cache()` | | Silver (sales + returns) s | `<<>>` | | | |
+| 3 | Broadcast hints for small dimensions (and MERGE hints to price auto-broadcast) (x10) | Avoid shuffling the big side | Gold join step s | 3.08–3.96 | 2.95–3.95 | −0.3 to −4.0 % (no change); MERGE: +7.9 to +50.6 % | Hints: no; MERGE: yes |
+| 4 | Fewer wide operations (x10): pre-aggregate before join (daily), drop a join (monthly), GROUP BY de-dup (Silver) | Less data through shuffles/joins | s | 3.889 / 3.958 / 46.776 | 2.868 / 3.035 / 43.726 | −26.3 % / −23.3 % / −6.5 % | Yes |
+| 5 | Stage Silver once: Delta table vs `cache()` (x10; x1 in brackets) | Typing + window de-dup ran twice | Silver (sales + returns) s | 46.776 (8.581) | 37.245 / 36.501 (9.459 / 9.573) | −20.4 / −22.0 % (+10.2 / +11.6 %) | Yes |
 | 6 | Incremental `MERGE` + CDF instead of full rebuild | | | | | | |
 
 ## 5. Evidence

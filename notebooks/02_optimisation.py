@@ -41,6 +41,20 @@ print("pipeline SQL:", PIPELINE_DIR, "exists:", PIPELINE_DIR.exists())
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC **Autoreload.** Python imports each module once per session. After pulling new `src/` code
+# MAGIC into a running notebook, `from optimisation.compute import ...` would keep returning the OLD
+# MAGIC module from memory (that's the error Genie worked around with `importlib.reload`).
+# MAGIC Autoreload re-imports changed modules before every cell runs. It only reloads code on the
+# MAGIC driver, which is all we need: our `src/` code builds query plans on the driver.
+
+# COMMAND ----------
+
+# MAGIC %load_ext autoreload
+# MAGIC %autoreload 2
+
+# COMMAND ----------
+
 from pyspark.sql import functions as F
 
 from common.tables import (
@@ -885,14 +899,6 @@ probe_df.unpersist()
 
 # COMMAND ----------
 
-# The session may hold an older optimisation.benchmark from before the file was last
-# edited (a plain import reuses it); reload so the current harness measures this run.
-import importlib
-
-import optimisation.benchmark
-importlib.reload(optimisation.benchmark)
-from optimisation.benchmark import run_benchmark
-
 RUN_SILVER_COMPUTE = True
 SILVER_SCALES = {"x1": (BRONZE_TRANSACTIONS, baseline_x1), SCALE: (BRONZE_XN, baseline_xn)}
 silver_vs = {s: silver_variants(bronze, s) for s, (bronze, _) in SILVER_SCALES.items()}
@@ -961,23 +967,6 @@ assert all(r["same_data"] for r in silver_rows), "A Silver variant changed the d
 
 # COMMAND ----------
 
-# The session may hold older copies of the project modules from before they were last
-# edited (a plain import reuses them); reload in dependency order and re-bind what
-# this cell uses.
-import importlib
-
-import optimisation.builds
-importlib.reload(optimisation.builds)
-from optimisation.builds import BASELINE_STEPS, BuildContext
-
-# compute imports from transformations.gold: reload that first so compute picks up
-# the current build functions (e.g. build_customer_cohort_retention's join_hint).
-import transformations.gold
-importlib.reload(transformations.gold)
-import optimisation.compute
-importlib.reload(optimisation.compute)
-from optimisation.compute import GOLD_JOIN_STEPS, gold_variants, plan_summary, plan_text
-
 GOLD_SCALES = {"x1": baseline_x1, SCALE: baseline_xn}
 gold_vs = {s: gold_variants(base.names, s) for s, base in GOLD_SCALES.items()}
 steps_by_name = {s.name: s for s in BASELINE_STEPS}
@@ -988,7 +977,11 @@ for v in gold_vs[SCALE]:
     for step in GOLD_JOIN_STEPS:
         df = v.step_overrides.get(step, steps_by_name[step].build)(ctx)
         plans.append({"step": step, "experiment": v.experiment, **plan_summary(plan_text(df))})
-print(markdown_table(plans, ["step", "experiment", "joins", "shuffles", "broadcasts"]))
+print(
+    markdown_table(
+        plans, ["step", "experiment", "joins", "shuffles", "broadcasts", "runtime_filter"]
+    )
+)
 
 # COMMAND ----------
 
@@ -997,17 +990,6 @@ print(markdown_table(plans, ["step", "experiment", "joins", "shuffles", "broadca
 # MAGIC 4 variants × 4 steps × 4 runs per scale, interleaved; ~5 minutes per scale.
 
 # COMMAND ----------
-
-# The session can hold older module bindings after src/ edits; reload in dependency
-# order so run_benchmark constructs contexts with the current BuildContext
-# (benchmark imports it from builds, which imports from transformations.gold).
-import importlib
-
-import optimisation.builds
-importlib.reload(optimisation.builds)
-import optimisation.benchmark
-importlib.reload(optimisation.benchmark)
-from optimisation.benchmark import run_benchmark
 
 RUN_GOLD_COMPUTE = True
 
@@ -1069,5 +1051,26 @@ assert all(r["same_data"] for r in gold_rows), "A Gold variant changed the data"
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ### 6d. Reading one plan (monthly sales, baseline, x10)
+# MAGIC
+# MAGIC Read it bottom-up (data flows upwards). What to look for:
+# MAGIC - `PhotonBroadcastHashJoin`: dim_date (739 rows) is copied to every executor; the 10M-row
+# MAGIC   fact is never shuffled for the join. On Photon a broadcast is a Sink -> `PhotonShuffleMapStage`
+# MAGIC   **`EXECUTOR_BROADCAST`** -> Source triple; a shuffle is the same triple with
+# MAGIC   **`ENSURE_REQUIREMENTS`** and `hashpartitioning(...)`.
+# MAGIC - `OptionalDataFilters: [hashedrelationcontains(date_key)]` on the fact scan: a **runtime
+# MAGIC   filter** built from the broadcast side, so fact rows whose date_key isn't in dim_date are
+# MAGIC   dropped while scanning. A free bonus of broadcasting.
+# MAGIC - `PhotonExpand` + three `PhotonGroupingAgg`: how Spark computes two `COUNT(DISTINCT ...)`
+# MAGIC   at once: each row is copied per distinct expression (Expand), de-duplicated, then counted.
+# MAGIC   That's 2 of the 3 shuffles; the 3rd feeds the `SUM(...) OVER (PARTITION BY year_month)` window.
+# MAGIC - `AdaptiveSparkPlan isFinalPlan=false`: this is the plan *before* running; AQE can still
+# MAGIC   change it. The query profile shows the final plan (step 2.7).
+
+# COMMAND ----------
+
 v = gold_vs[SCALE][0]  # baseline
-print(plan_text(BuildContext(spark, v.names, PIPELINE_DIR).sql_file("gold_monthly_country_sales.sql")))
+print(
+    plan_text(BuildContext(spark, v.names, PIPELINE_DIR).sql_file("gold_monthly_country_sales.sql"))
+)
