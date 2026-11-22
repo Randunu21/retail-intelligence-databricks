@@ -65,6 +65,7 @@ from common.tables import (
     BRONZE_TRANSACTIONS,
     CATALOG,
     bench_bronze,
+    bench_table,
     fq,
 )
 from optimisation.benchmark import (
@@ -96,6 +97,15 @@ from optimisation.compute import (
     plan_summary,
     plan_text,
     silver_variants,
+)
+from optimisation.incremental import (
+    DEFAULT_BATCHES,
+    INCREMENTAL_TABLES,
+    LOG_COLUMNS,
+    LOG_SCHEMA,
+    DeltaBackend,
+    IncrementalLoader,
+    log_rows,
 )
 from optimisation.layout import FACT_STEP, LAYOUT_QUERIES, layout_variants
 from optimisation.scaling import expected_rows, replicate_bronze
@@ -1073,4 +1083,127 @@ assert all(r["same_data"] for r in gold_rows), "A Gold variant changed the data"
 v = gold_vs[SCALE][0]  # baseline
 print(
     plan_text(BuildContext(spark, v.names, PIPELINE_DIR).sql_file("gold_monthly_country_sales.sql"))
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 7. Incremental loading: MERGE INTO + Change Data Feed
+# MAGIC
+# MAGIC **The problem:** every pipeline run rebuilds Silver and Gold from *all* of Bronze, even if
+# MAGIC only one new month arrived. Like reprinting a whole phone book to add ten new numbers.
+# MAGIC
+# MAGIC **The incremental pattern** (`optimisation.incremental`), simulated on the x10 replica by
+# MAGIC splitting Bronze into an **initial load** (before Oct 2011) + **3 monthly increments**:
+# MAGIC 1. **Silver:** stage only the new month, then `MERGE INTO silver_sales ... WHEN NOT MATCHED
+# MAGIC    THEN INSERT` on all business columns (NULL-safe `<=>`). The target is clustered by
+# MAGIC    `invoice_date` and the MERGE condition includes the batch's date range, so only the files
+# MAGIC    for those dates are read.
+# MAGIC 2. **Fact:** Silver has **Change Data Feed** on. A **checkpoint** table stores the last Silver
+# MAGIC    version processed; the fact step reads only rows inserted since then and MERGEs them on
+# MAGIC    `line_id`.
+# MAGIC 3. **Gold:** dim_date (739 rows) is rebuilt; daily_sales rows are recomputed **only for affected
+# MAGIC    days** (days with new sales + new calendar days) and UPSERTed (`WHEN MATCHED UPDATE`).
+# MAGIC
+# MAGIC **Idempotent** = running the same batch twice gives the same result as running it once:
+# MAGIC insert-only MERGEs skip keys that exist, the checkpoint prevents re-reading old changes,
+# MAGIC and recomputed days overwrite themselves with identical rows. Proven in 7d.
+# MAGIC
+# MAGIC **Not incremental here:** dim_product / dim_customer choose "most frequent" values over all
+# MAGIC history, so new data can change existing rows; they need a recompute or SCD handling.
+
+# COMMAND ----------
+
+RUN_INCREMENTAL = True
+INC_PREFIX = f"{SCALE}_inc"
+inc_names = {t: bench_table(INC_PREFIX, t) for t in INCREMENTAL_TABLES}
+inc_names["bronze"] = BRONZE_XN
+loader = IncrementalLoader(
+    DeltaBackend(spark, checkpoint_table=bench_table(INC_PREFIX, "checkpoints")),
+    inc_names,
+    PIPELINE_DIR,
+)
+
+if RUN_INCREMENTAL:
+    spark.sql(f"DROP TABLE IF EXISTS {bench_table(INC_PREFIX, 'checkpoints')}")  # fresh start
+    print(loader.initial_load(DEFAULT_BATCHES[0][2]))
+    for name, lo, hi in DEFAULT_BATCHES[1:]:
+        print(loader.apply_batch(name, lo, hi))
+
+INC_COLS = [name for name, _ in LOG_COLUMNS]
+INC_LOG_TABLE = bench_table(INC_PREFIX, "load_log")
+if RUN_INCREMENTAL:  # keep the run's log in Delta, so 7e works after a restart too
+    spark.createDataFrame(log_rows(loader.log), LOG_SCHEMA).write.mode("overwrite").saveAsTable(
+        INC_LOG_TABLE
+    )
+inc_log = [r.asDict() for r in spark.read.table(INC_LOG_TABLE).collect()]
+print(markdown_table(inc_log, INC_COLS))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 7c. Initial + increments == full rebuild?
+# MAGIC Each incrementally built table must have exactly the same rows as the x10 full-rebuild
+# MAGIC baseline (same fingerprint).
+
+# COMMAND ----------
+
+inc_checks = []
+for t in INCREMENTAL_TABLES:
+    a = fingerprint(spark.read.table(inc_names[t])).first()
+    b = fingerprint(spark.read.table(baseline_xn.names[t])).first()
+    inc_checks.append(
+        {"table": t, "incremental_rows": a.rows, "full_rows": b.rows, "match": a == b}
+    )
+print(markdown_table(inc_checks, ["table", "incremental_rows", "full_rows", "match"]))
+assert all(c["match"] for c in inc_checks), "Incremental result differs from the full rebuild"
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 7d. Idempotency: re-run the last batch
+# MAGIC Everything inserted / recomputed must be 0 and every fingerprint unchanged.
+
+# COMMAND ----------
+
+before = {t: fingerprint(spark.read.table(inc_names[t])).first() for t in INCREMENTAL_TABLES}
+rerun = loader.apply_batch(f"{DEFAULT_BATCHES[-1][0]} (re-run)", *DEFAULT_BATCHES[-1][1:])
+after = {t: fingerprint(spark.read.table(inc_names[t])).first() for t in INCREMENTAL_TABLES}
+print(markdown_table([rerun], INC_COLS))
+print("unchanged:", {t: before[t] == after[t] for t in INCREMENTAL_TABLES})
+assert all(before[t] == after[t] for t in INCREMENTAL_TABLES), "Re-run changed a table"
+assert rerun["silver_rows_inserted"] == rerun["fact_rows_inserted"] == rerun["days_recomputed"] == 0
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 7e. Incremental vs full rebuild (x10)
+# MAGIC Full rebuild = the sum of the x10 baseline medians for the same five tables (run 39753a7e,
+# MAGIC section 4). Each increment is a single run (a batch can only be loaded once), so treat its
+# MAGIC time as indicative; the gap to the full rebuild is what matters.
+
+# COMMAND ----------
+
+base_summary = {
+    r.step: r
+    for r in summarise(
+        spark.read.table(BENCHMARK_RUNS).filter(F.col("run_id") == BASELINE_XN_RUN_ID)
+    ).collect()
+}
+full_s = round(sum(base_summary[t].median_s for t in INCREMENTAL_TABLES), 3)
+cmp_rows = [
+    {
+        "batch": e["batch"],
+        "incremental_s": e["total_s"],
+        "full_rebuild_s": full_s,
+        "pct_vs_full": round((e["total_s"] - full_s) / full_s * 100, 1),
+        "fact_rows_inserted": e.get("fact_rows_inserted", "-"),
+    }
+    for e in inc_log
+    if e["batch"] != "initial"
+]
+print(
+    markdown_table(
+        cmp_rows, ["batch", "incremental_s", "full_rebuild_s", "pct_vs_full", "fact_rows_inserted"]
+    )
 )

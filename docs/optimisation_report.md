@@ -217,13 +217,40 @@ Bold = beyond noise (ranges don't overlap). Runs: 2026-11-21/22.
 - GROUP BY de-dup is a steady −6.5 to −6.7 % at both scales (no sort; partial aggregation before
   the shuffle). Its combination with staging-once was not measured separately.
 
-**Gold join plans** (x10, `plan_summary` of each query's physical plan before execution):
-`<<re-run §6b with the fixed counter>>`. Join types from the first run (reliable):
-baseline = auto-broadcast for monthly (dim_date), product_performance and two cohort joins;
-daily_sales is a `ShuffledHashJoin` because dim_date is the preserved side of its LEFT JOIN.
-`broadcast` hints produced plans identical to the baseline; `MERGE` hints switched joins to
-`SortMergeJoin`. (The first run's shuffle/broadcast counts were wrong: the counter didn't know
-Photon's node names; fixed and tested against a real plan.)
+**Gold join plans** (x10, `plan_summary` of each physical plan before execution; Photon:
+a broadcast = `PhotonShuffleMapStage EXECUTOR_BROADCAST`, a shuffle = `... ENSURE_REQUIREMENTS`;
+runtime filter = `hashedrelationcontains(...)` on the big side's scan):
+
+| Step | Variant | Joins | Shuffles | Broadcasts | Runtime filter |
+|---|---|---|---:|---:|---|
+| daily_sales | baseline | ShuffledHashJoin×1 | 4 | 0 | no |
+| daily_sales | broadcast | ShuffledHashJoin×1 | 4 | 0 | no |
+| daily_sales | no_broadcast | SortMergeJoin×1 | 4 | 0 | no |
+| daily_sales | rewrite | BroadcastHashJoin×3 | 5 | 3 | no |
+| monthly_country_sales | baseline | BroadcastHashJoin×1 | 3 | 1 | yes |
+| monthly_country_sales | broadcast | BroadcastHashJoin×1 | 3 | 1 | yes |
+| monthly_country_sales | no_broadcast | SortMergeJoin×1 | 5 | 0 | no |
+| monthly_country_sales | rewrite | ShuffledHashJoin×2 | 10 | 0 | no |
+| product_performance | baseline | BroadcastHashJoin×5 | 6 | 5 | yes |
+| product_performance | broadcast | BroadcastHashJoin×5 | 6 | 5 | yes |
+| product_performance | no_broadcast | BroadcastHashJoin×3, SortMergeJoin×2 | 7 | 3 | no |
+| product_performance | rewrite (= baseline query) | BroadcastHashJoin×5 | 6 | 5 | yes |
+| cohort_retention | baseline | BroadcastHashJoin×2, BroadcastNestedLoopJoin×1, ShuffledHashJoin×1 | 7 | 3 | no |
+| cohort_retention | broadcast | same as baseline | 7 | 3 | no |
+| cohort_retention | no_broadcast | BroadcastNestedLoopJoin×1, SortMergeJoin×3 | 10 | 1 | no |
+| cohort_retention | rewrite (= baseline query) | same as baseline | 7 | 3 | no |
+
+- `broadcast` hints produced plans **identical** to the baseline: the optimiser already broadcasts
+  the small sides. For daily_sales the hint is ignored (0 broadcasts): dim_date is the preserved
+  side of the LEFT JOIN.
+- `MERGE` hints add shuffles of the 10M-row fact (monthly 3 → 5) **and** lose the runtime filter
+  (the broadcast dim_date pruning fact rows during the scan): the +50.6 % for monthly sales.
+- The rewrites have **more** shuffles (daily 4 → 5, monthly 3 → 10) yet are 23–26 % faster:
+  shuffle *count* isn't the cost, shuffled *volume* is. The baseline monthly plan
+  (`PhotonExpand`) copies every fact row 3× (one per COUNT DISTINCT + one for the sums) before
+  its first shuffle; the rewrites shuffle small pre-aggregated results. The extra joins in the
+  rewrite plans are most likely Spark computing each COUNT DISTINCT separately and joining the
+  small results back (not confirmed from the rewrite plans themselves).
 
 **Gold join timing** (median s; % vs baseline; bold = beyond noise):
 
@@ -250,7 +277,27 @@ Photon's node names; fixed and tested against a real plan.)
 - Note: the monthly rewrite's `year_month` is nullable where the pipeline's (from dim_date) is
   NOT NULL; values are identical.
 
-### 4.3 Summary of all changes
+### 4.3 Incremental loading: MERGE INTO + Change Data Feed (step 2.5)
+
+Simulation on the x10 replica: initial load = Bronze before 2011-10-01, then three monthly
+increments (Oct, Nov, Dec 2011). Per increment: Silver = stage the batch only + insert-only
+`MERGE` (NULL-safe key on all business columns, target clustered by `invoice_date`, batch date
+range in the MERGE condition); fact = Silver's Change Data Feed since a stored checkpoint +
+`MERGE` on `line_id`; dim_date rebuilt; daily_sales recomputed for affected days only + upsert.
+
+| Batch | Silver rows inserted | Fact rows inserted | Days recomputed | Silver s | Fact s | Gold s | Total s | Full rebuild s | vs full |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `<<from notebook §7b / 7e>>` | | | | | | | | | |
+
+- Initial + increments == full rebuild for all 5 tables (fingerprints): `<<§7c>>`
+- Re-running the last batch inserts 0 rows, recomputes 0 days, changes no fingerprint: `<<§7d>>`
+- Full rebuild = sum of the x10 baseline medians for the same 5 tables (run 39753a7e);
+  increments are single runs (a batch can only be loaded once), so their times are indicative.
+- Locally (pytest) the same loader code runs against an in-memory imitation of MERGE/CDF and
+  is checked against a full rebuild, including new zero-sales calendar days.
+- Not incremental: dim_product / dim_customer ("most frequent" values over all history).
+
+### 4.4 Summary of all changes
 
 | # | Change | Why | Metric | Before | After | % change | Beyond noise? |
 |---|---|---|---|---:|---:|---:|---|
@@ -259,7 +306,7 @@ Photon's node names; fixed and tested against a real plan.)
 | 3 | Broadcast hints for small dimensions (and MERGE hints to price auto-broadcast) (x10) | Avoid shuffling the big side | Gold join step s | 3.08–3.96 | 2.95–3.95 | −0.3 to −4.0 % (no change); MERGE: +7.9 to +50.6 % | Hints: no; MERGE: yes |
 | 4 | Fewer wide operations (x10): pre-aggregate before join (daily), drop a join (monthly), GROUP BY de-dup (Silver) | Less data through shuffles/joins | s | 3.889 / 3.958 / 46.776 | 2.868 / 3.035 / 43.726 | −26.3 % / −23.3 % / −6.5 % | Yes |
 | 5 | Stage Silver once: Delta table vs `cache()` (x10; x1 in brackets) | Typing + window de-dup ran twice | Silver (sales + returns) s | 46.776 (8.581) | 37.245 / 36.501 (9.459 / 9.573) | −20.4 / −22.0 % (+10.2 / +11.6 %) | Yes |
-| 6 | Incremental `MERGE` + CDF instead of full rebuild | | | | | | |
+| 6 | Incremental `MERGE` + CDF instead of full rebuild (x10) | Only new rows are processed | s per monthly increment | `<<full>>` | `<<inc>>` | `<<>>` | Single runs per batch |
 
 ## 5. Evidence
 
