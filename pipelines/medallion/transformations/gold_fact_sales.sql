@@ -7,11 +7,15 @@
 --   customer_key  -> gold.dim_customer  (-1 = unknown customer instead of a NULL key)
 --   stock_code    -> gold.dim_product
 --   date_key      -> gold.dim_date      (yyyyMMdd as INT)
+-- Layout (Phase 2.6): liquid clustering on (date_key, customer_key). Date-range reports and
+-- customer lookups skip files: on the x10 replica they read 38–56 % fewer bytes (Phase 2.3).
+-- Chosen over partitioning, which made ~600 tiny daily files and slowed everything else.
 -- Convention used by the tests: the query starts after a line containing only "AS".
 
 CREATE OR REFRESH MATERIALIZED VIEW retail.gold.fact_sales
 COMMENT 'Sales fact, one row per de-duplicated invoice line. FKs: customer_key, stock_code, date_key.'
 TBLPROPERTIES ('delta.feature.timestampNtz' = 'supported')
+CLUSTER BY (date_key, customer_key)
 AS
 SELECT
   xxhash64(

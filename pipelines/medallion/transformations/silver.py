@@ -1,7 +1,7 @@
 """Lakeflow pipeline source: Silver layer (typed, cleaned, de-duplicated) with expectations.
 
 Datasets defined here:
-- silver_staged       temporary view: Bronze typed + flags + _dup_rank (nothing removed)
+- silver_staged       PRIVATE materialized view: Bronze typed + flags + _dup_rank (nothing removed)
 - sales_validated     temporary view: SALES_DROP_RULES (drop) + SALES_WARN_RULES (warn)
 - returns_validated   temporary view: cancellations only, RETURNS_* rules
 - retail.silver.sales / retail.silver.returns   materialized views (final columns only)
@@ -10,6 +10,13 @@ Expectations sit on the `*_validated` views because they are evaluated on the da
 output, and the helper columns they need (_dup_rank, is_cancellation, ...) must not end up
 in the final tables. Each rule's pass/fail counts go to the pipeline event log, which is
 what retail.silver.dq_log is built from (step 1.3).
+
+Phase 2.6: `silver_staged` was a temporary view. A temporary view is inlined into every
+reader, so the expensive staging (typing + window de-dup over all Bronze rows) ran twice:
+once for sales, once for returns. As a PRIVATE materialized view it is computed once per
+update and both read the stored result; `private=True` keeps it inside the pipeline (not
+published to the catalog). Measured in notebooks/02_optimisation §6a: Silver −20 % on the x10
+replica, +10 % (~0.9 s) at x1. Kept for growth; see docs/optimisation_report.md.
 """
 
 import sys
@@ -32,7 +39,13 @@ from transformations.silver import (
 )
 
 
-@dp.temporary_view(comment="Bronze rows typed + snake_case + flags + _dup_rank. Nothing removed.")
+@dp.materialized_view(
+    name="silver_staged",
+    private=True,
+    comment="Bronze rows typed + snake_case + flags + _dup_rank. Nothing removed. Computed once "
+    "per update and shared by sales and returns (Phase 2.6).",
+    table_properties=SILVER_TABLE_PROPERTIES,
+)
 def silver_staged():
     # Batch read of the Bronze streaming table: de-duplication needs to see all rows.
     return stage_silver(spark.read.table(BRONZE_TRANSACTIONS))

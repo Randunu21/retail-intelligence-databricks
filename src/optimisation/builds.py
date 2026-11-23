@@ -137,9 +137,22 @@ def _silver_returns(ctx: BuildContext) -> DataFrame:
     return to_silver_output(apply_drop_rules(staged, RETURNS_DROP_RULES))
 
 
+# Gold queries rewritten in the pipeline in step 2.6. The baseline keeps measuring their
+# Phase 1 versions, frozen in src/optimisation/phase1_sql/ (see the README there).
+PHASE1_SQL_DIR = Path(__file__).resolve().parent / "phase1_sql"
+FROZEN_PHASE1_FILES = frozenset({"gold_daily_sales.sql", "gold_monthly_country_sales.sql"})
+
+
+def phase1_query(ctx: BuildContext, file_name: str) -> str:
+    """A Gold query as it was in Phase 1 (frozen copy if rewritten since), retargeted."""
+    if file_name in FROZEN_PHASE1_FILES:
+        return load_query(PHASE1_SQL_DIR, file_name, ctx.mapping)
+    return ctx.query(file_name)
+
+
 def _sql_step(file_name: str) -> Callable[[BuildContext], DataFrame]:
     def _build(ctx: BuildContext) -> DataFrame:
-        return ctx.sql_file(file_name)
+        return ctx.spark.sql(phase1_query(ctx, file_name))
 
     _build.__name__ = f"sql:{file_name}"
     return _build

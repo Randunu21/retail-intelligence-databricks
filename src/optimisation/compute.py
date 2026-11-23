@@ -49,7 +49,7 @@ from pyspark.sql import functions as F
 
 from common.tables import bench_table
 from optimisation.benchmark import Variant, WriteSpec, write_table
-from optimisation.builds import BuildContext, BuildStep
+from optimisation.builds import BuildContext, BuildStep, phase1_query
 from transformations.gold import build_customer_cohort_retention
 from transformations.silver import (
     BUSINESS_COLUMNS,
@@ -186,7 +186,8 @@ def _hinted(step: str, strategy: str):
     file_name, occurrence, aliases = _HINT_TARGETS[step]
 
     def _build(ctx: BuildContext) -> DataFrame:
-        return ctx.spark.sql(add_hint(ctx.query(file_name), f"{strategy}({aliases})", occurrence))
+        query = phase1_query(ctx, file_name)  # hints apply to the Phase 1 queries
+        return ctx.spark.sql(add_hint(query, f"{strategy}({aliases})", occurrence))
 
     return _build
 
@@ -200,60 +201,10 @@ def _cohort(hint: str):
     return _build
 
 
-# daily_sales, rewritten: aggregate 10M fact rows down to one row per date_key FIRST, then
-# left-join the 739-row calendar. Same columns, types and values as the pipeline query
-# (an invoice belongs to exactly one day, so per-day DISTINCT counts are unchanged).
-DAILY_SALES_PREAGG_SQL = """
-WITH f AS (
-  SELECT
-    date_key,
-    SUM(line_revenue)                                                    AS revenue,
-    COUNT(DISTINCT invoice)                                              AS invoices,
-    SUM(quantity)                                                        AS units,
-    COUNT(line_id)                                                       AS lines,
-    COUNT(DISTINCT CASE WHEN customer_key <> -1 THEN customer_key END)   AS customers
-  FROM retail.gold.fact_sales
-  GROUP BY date_key
-)
-SELECT
-  d.date_key,
-  d.date,
-  d.year_month,
-  d.day_name,
-  d.is_weekend,
-  COALESCE(f.revenue, 0)                          AS revenue,
-  COALESCE(f.invoices, 0)                         AS invoices,
-  COALESCE(f.units, 0)                            AS units,
-  COALESCE(f.lines, 0)                            AS lines,
-  COALESCE(f.customers, 0)                        AS customers,
-  ROUND(try_divide(f.revenue, f.invoices), 2)     AS avg_basket_value
-FROM retail.gold.dim_date AS d
-LEFT JOIN f
-  ON f.date_key = d.date_key
-"""
-
-# monthly_country_sales, rewritten: year / month / year_month come from the fact's own
-# invoice_ts (dim_date derives them from the same date), so the join disappears.
-MONTHLY_COUNTRY_NOJOIN_SQL = """
-WITH monthly AS (
-  SELECT
-    date_format(f.invoice_ts, 'yyyy-MM')                                  AS year_month,
-    year(f.invoice_ts)                                                    AS year,
-    month(f.invoice_ts)                                                   AS month,
-    f.country,
-    SUM(f.line_revenue)                                                   AS revenue,
-    COUNT(DISTINCT f.invoice)                                             AS invoices,
-    SUM(f.quantity)                                                       AS units,
-    COUNT(DISTINCT CASE WHEN f.customer_key <> -1 THEN f.customer_key END) AS customers
-  FROM retail.gold.fact_sales AS f
-  GROUP BY 1, 2, 3, f.country
-)
-SELECT
-  *,
-  ROUND(revenue * 100 / SUM(revenue) OVER (PARTITION BY year_month), 3) AS revenue_share_pct
-FROM monthly
-"""
-
+# The rewrites (daily_sales aggregated before the join; monthly_country_sales without the
+# dim_date join) were adopted into the pipeline in step 2.6, so the "rewrite" variant now
+# simply runs the CURRENT pipeline files, while "baseline" runs the frozen Phase 1 copies
+# (optimisation.builds.PHASE1_SQL_DIR). One source of truth for each version.
 GOLD_OVERRIDES: dict[str, dict[str, object]] = {
     "baseline": {},
     "broadcast": {
@@ -265,8 +216,8 @@ GOLD_OVERRIDES: dict[str, dict[str, object]] = {
         "gold_customer_cohort_retention": _cohort("merge"),
     },
     "rewrite": {
-        "gold_daily_sales": lambda ctx: ctx.sql_text(DAILY_SALES_PREAGG_SQL),
-        "gold_monthly_country_sales": lambda ctx: ctx.sql_text(MONTHLY_COUNTRY_NOJOIN_SQL),
+        "gold_daily_sales": lambda ctx: ctx.sql_file("gold_daily_sales.sql"),
+        "gold_monthly_country_sales": lambda ctx: ctx.sql_file("gold_monthly_country_sales.sql"),
     },
 }
 

@@ -198,3 +198,18 @@ def test_plan_summary_reads_photon_plan():
     assert s["joins"] == "BroadcastHashJoin×1"
     assert (s["shuffles"], s["broadcasts"]) == (3, 1)
     assert s["runtime_filter"] is True and s["adaptive"] is True
+
+
+def test_phase1_sql_is_frozen_and_differs_from_pipeline():
+    """The baseline must keep measuring Phase 1: frozen copies exist and differ from the
+    rewritten pipeline files (whose results are proven equal in the variant test above)."""
+    from optimisation.builds import FROZEN_PHASE1_FILES, PHASE1_SQL_DIR
+
+    for name in FROZEN_PHASE1_FILES:
+        frozen, current = (PHASE1_SQL_DIR / name).read_text(), (PIPELINE_DIR / name).read_text()
+        assert frozen != current
+        assert "retail.gold.dim_date" in frozen  # both Phase 1 queries joined dim_date
+    assert (
+        "JOIN retail.gold.dim_date"
+        not in (PIPELINE_DIR / "gold_monthly_country_sales.sql").read_text()
+    )

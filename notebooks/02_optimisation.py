@@ -62,6 +62,7 @@ from common.tables import (
     BENCHMARK_IO_PROBES,
     BENCHMARK_QUERY_METRICS,
     BENCHMARK_RUNS,
+    PIPELINE_EVENT_LOG,
     BRONZE_TRANSACTIONS,
     CATALOG,
     bench_bronze,
@@ -108,6 +109,7 @@ from optimisation.incremental import (
     log_rows,
 )
 from optimisation.layout import FACT_STEP, LAYOUT_QUERIES, layout_variants
+from optimisation.pipeline_runs import before_after, flow_summary, update_summary
 from optimisation.scaling import expected_rows, replicate_bronze
 from transformations.silver import stage_silver
 
@@ -457,7 +459,7 @@ print(markdown_table(bronze_info, ["bronze", "rows", "files", "size_mb"]))
 
 # COMMAND ----------
 
-RUN_BASELINE_XN = True
+RUN_BASELINE_XN = False  # recorded; True only to re-measure
 REPETITIONS_XN = 3
 ONLY_STEPS = None  # e.g. ["gold_product_performance", "gold_customer_cohort_retention"]
 
@@ -619,7 +621,7 @@ print(
 # COMMAND ----------
 
 LAYOUT_SCALES = {"x1": baseline_x1, SCALE: baseline_xn}
-RUN_LAYOUT_BUILD = True
+RUN_LAYOUT_BUILD = False  # recorded; True only to re-measure
 LAYOUT_REPS = 3
 
 layout = {s: layout_variants(base.names, s) for s, base in LAYOUT_SCALES.items()}
@@ -705,7 +707,7 @@ assert all(r["same_data"] for r in layout_build), "A layout variant changed the 
 
 # COMMAND ----------
 
-RUN_LAYOUT_READS = True
+RUN_LAYOUT_READS = False  # recorded; True only to re-measure
 READ_REPS = 5
 
 if RUN_LAYOUT_READS:
@@ -790,7 +792,7 @@ display(recent)
 
 # COMMAND ----------
 
-RUN_IO_PROBE = True
+RUN_IO_PROBE = False  # recorded; True only to re-measure
 
 if RUN_IO_PROBE:
     probe_id = str(uuid.uuid4())  # one id for both scales
@@ -909,7 +911,7 @@ probe_df.unpersist()
 
 # COMMAND ----------
 
-RUN_SILVER_COMPUTE = True
+RUN_SILVER_COMPUTE = False  # recorded; True only to re-measure
 SILVER_SCALES = {"x1": (BRONZE_TRANSACTIONS, baseline_x1), SCALE: (BRONZE_XN, baseline_xn)}
 silver_vs = {s: silver_variants(bronze, s) for s, (bronze, _) in SILVER_SCALES.items()}
 
@@ -1001,7 +1003,7 @@ print(
 
 # COMMAND ----------
 
-RUN_GOLD_COMPUTE = True
+RUN_GOLD_COMPUTE = False  # recorded; True only to re-measure
 
 if RUN_GOLD_COMPUTE:
     for s, variants in gold_vs.items():
@@ -1114,7 +1116,7 @@ print(
 
 # COMMAND ----------
 
-RUN_INCREMENTAL = True
+RUN_INCREMENTAL = False  # recorded; True only to re-measure
 INC_PREFIX = f"{SCALE}_inc"
 inc_names = {t: bench_table(INC_PREFIX, t) for t in INCREMENTAL_TABLES}
 inc_names["bronze"] = BRONZE_XN
@@ -1207,3 +1209,90 @@ print(
         cmp_rows, ["batch", "incremental_s", "full_rebuild_s", "pct_vs_full", "fact_rows_inserted"]
     )
 )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 8. The winners, applied to the real pipeline
+# MAGIC
+# MAGIC Changes in `pipelines/medallion/transformations/` (step 2.6):
+# MAGIC
+# MAGIC | Change | File | Evidence |
+# MAGIC |---|---|---|
+# MAGIC | `silver_staged`: temporary view → **private materialized view** (staging computed once) | `silver.py` | §6a: Silver −20 % at x10, +10 % at x1 |
+# MAGIC | `fact_sales` **`CLUSTER BY (date_key, customer_key)`** | `gold_fact_sales.sql` | §5: 38–56 % fewer bytes read at x10 |
+# MAGIC | daily_sales: **aggregate before the join** | `gold_daily_sales.sql` | §6c: −26.3 % at x10 |
+# MAGIC | monthly_country_sales: **no join to dim_date** | `gold_monthly_country_sales.sql` | §6c: −23.3 % at x10 |
+# MAGIC
+# MAGIC Not applied: GROUP BY de-dup (−6.5 %, but duplicates would vanish before the `not_duplicate`
+# MAGIC expectation and the DQ log would lose that count), partitioning, broadcast hints (no effect),
+# MAGIC hand-written incremental MERGE (in a pipeline, the native route is declarative CDC).
+# MAGIC
+# MAGIC The pipeline runs on the **real (x1) data**, where §6 measured little or no gain, so the
+# MAGIC honest expectation for this confirmation is "about the same", not "faster".
+# MAGIC
+# MAGIC ### 8a. Same data as Phase 1?
+# MAGIC The x1 baseline copies (`retail.bench.x1_baseline__*`) were built with Phase 1 logic and match
+# MAGIC Phase 1 production (§3a). After a pipeline update with the new code, every production table
+# MAGIC must still match them.
+
+# COMMAND ----------
+
+prod_checks = []
+for step in BASELINE_STEPS:
+    prod = fingerprint(spark.read.table(PROD_NAMES[step.name])).first()
+    phase1 = fingerprint(spark.read.table(baseline_x1.names[step.name])).first()
+    prod_checks.append(
+        {"table": PROD_NAMES[step.name], "rows": prod.rows, "same_as_phase1": prod == phase1}
+    )
+print(markdown_table(prod_checks, ["table", "rows", "same_as_phase1"]))
+assert all(c["same_as_phase1"] for c in prod_checks), "The new pipeline changed a table's data"
+
+fact_detail = describe_detail(spark, PROD_NAMES["gold_fact_sales"])
+print(
+    "fact_sales clustering columns:",
+    fact_detail.clustering_columns or "(none)",
+    "| files:",
+    fact_detail.num_files,
+)
+for schema in ("bronze", "silver"):  # private = not published to the catalog
+    print(
+        f"retail.{schema}.silver_staged published?",
+        spark.catalog.tableExists(f"retail.{schema}.silver_staged"),
+    )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 8b. Pipeline run times before vs after (event log)
+# MAGIC
+# MAGIC Only **completed full-refresh** updates count (a normal update skips tables whose inputs
+# MAGIC didn't change). Set `CHANGE_TS` to a time between your last "before" run and your first
+# MAGIC "after" run (UTC, as shown in `started_at` below). One sample per update, with platform
+# MAGIC start-up noise: a confirmation, not the measurement.
+
+# COMMAND ----------
+
+events = spark.read.table(PIPELINE_EVENT_LOG)
+updates = update_summary(events)
+print(
+    markdown_table(
+        [r.asDict() for r in updates.limit(10).collect()],
+        ["update_id", "started_at", "full_refresh", "final_state", "total_s", "run_s"],
+    )
+)
+
+# COMMAND ----------
+
+CHANGE_TS = (
+    "2026-11-22 00:00:00"  # <- set: after the last "before" update, before the first "after"
+)
+
+cmp_pipeline = before_after(updates, flow_summary(events), CHANGE_TS)
+print(
+    markdown_table(
+        [r.asDict() for r in cmp_pipeline.collect()],
+        ["flow", "n_before", "before_s", "n_after", "after_s", "pct_change"],
+    )
+)
+print("x10 baseline run used in §7e:", BASELINE_XN_RUN_ID)

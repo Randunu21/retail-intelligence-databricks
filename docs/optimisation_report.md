@@ -285,14 +285,28 @@ increments (Oct, Nov, Dec 2011). Per increment: Silver = stage the batch only + 
 range in the MERGE condition); fact = Silver's Change Data Feed since a stored checkpoint +
 `MERGE` on `line_id`; dim_date rebuilt; daily_sales recomputed for affected days only + upsert.
 
-| Batch | Silver rows inserted | Fact rows inserted | Days recomputed | Silver s | Fact s | Gold s | Total s | Full rebuild s | vs full |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `<<from notebook §7b / 7e>>` | | | | | | | | | |
+Initial load (Bronze before 2011-10-01, a normal full build of the 5 tables): 72.325 s.
 
-- Initial + increments == full rebuild for all 5 tables (fingerprints): `<<§7c>>`
-- Re-running the last batch inserts 0 rows, recomputes 0 days, changes no fingerprint: `<<§7d>>`
-- Full rebuild = sum of the x10 baseline medians for the same 5 tables (run 39753a7e);
-  increments are single runs (a batch can only be loaded once), so their times are indicative.
+| Batch | Silver rows inserted | Return rows | Fact rows inserted | Days recomputed | Silver s | Fact s | Gold s | Total s | Full rebuild s | vs full |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2011-10 | 583,060 | 11,200 | 583,060 | 31 | 7.536 | 10.725 | 9.883 | 28.143 | 58.737 | −52.1 % |
+| 2011-11 | 817,270 | 10,130 | 817,270 | 30 | 8.483 | 11.327 | 9.067 | 28.877 | 58.737 | −50.8 % |
+| 2011-12 | 247,530 | 3,470 | 247,530 | 9 | 6.708 | 10.329 | 8.392 | 25.429 | 58.737 | −56.7 % |
+| 2011-12 re-run | 0 | 0 | 0 | 0 | 5.450 | 7.446 | 3.691 | 16.587 | – | – |
+
+- **Initial + increments == full rebuild** for all 5 tables (fingerprints): silver_sales
+  10,033,570, silver_returns 179,150, fact_sales 10,033,570, dim_date 739, daily_sales 739 rows.
+- **Idempotent:** re-running the last batch inserted 0 rows, recomputed 0 days, and left every
+  fingerprint unchanged.
+- **An increment costs about half a full rebuild** (25–29 s vs 58.7 s) at x10.
+- **Most of an increment is fixed overhead:** the re-run with 0 new rows still took 16.6 s
+  (MERGE scans, CDF read, checkpoint MERGE, dim_date rebuild, counts). Going from 247,530 to
+  817,270 new rows added only ~3.5 s. So a daily batch (~1/30 of a month) would cost close to
+  that ~17 s floor, while a full rebuild keeps growing with history: the gap widens over time.
+- Full rebuild = sum of the x10 baseline medians for the same 5 tables, from run
+  `<<BASELINE_XN_RUN_ID>>`; increments are single runs (a batch can only be loaded once).
+- In a Lakeflow pipeline, Databricks recommends declarative CDC (`APPLY CHANGES` / AUTO CDC)
+  over hand-written MERGE; this notebook shows the mechanism that those features automate.
 - Locally (pytest) the same loader code runs against an in-memory imitation of MERGE/CDF and
   is checked against a full rebuild, including new zero-sales calendar days.
 - Not incremental: dim_product / dim_customer ("most frequent" values over all history).
@@ -306,11 +320,46 @@ range in the MERGE condition); fact = Silver's Change Data Feed since a stored c
 | 3 | Broadcast hints for small dimensions (and MERGE hints to price auto-broadcast) (x10) | Avoid shuffling the big side | Gold join step s | 3.08–3.96 | 2.95–3.95 | −0.3 to −4.0 % (no change); MERGE: +7.9 to +50.6 % | Hints: no; MERGE: yes |
 | 4 | Fewer wide operations (x10): pre-aggregate before join (daily), drop a join (monthly), GROUP BY de-dup (Silver) | Less data through shuffles/joins | s | 3.889 / 3.958 / 46.776 | 2.868 / 3.035 / 43.726 | −26.3 % / −23.3 % / −6.5 % | Yes |
 | 5 | Stage Silver once: Delta table vs `cache()` (x10; x1 in brackets) | Typing + window de-dup ran twice | Silver (sales + returns) s | 46.776 (8.581) | 37.245 / 36.501 (9.459 / 9.573) | −20.4 / −22.0 % (+10.2 / +11.6 %) | Yes |
-| 6 | Incremental `MERGE` + CDF instead of full rebuild (x10) | Only new rows are processed | s per monthly increment | `<<full>>` | `<<inc>>` | `<<>>` | Single runs per batch |
+| 6 | Incremental `MERGE` + CDF instead of full rebuild (x10) | Only new rows are processed | s per monthly increment | 58.737 (full rebuild) | 25.429–28.877 | −50.8 to −56.7 % | Single runs per batch; equals full rebuild; re-run is a no-op |
+
+### 4.5 Applied to the Lakeflow pipeline (step 2.6)
+
+| Change | File | Why (measured) |
+|---|---|---|
+| `silver_staged` temporary view → private materialized view (`private=True`) | `silver.py` | Staging computed once, not twice: Silver −20.4 % at x10 (+10.2 % at x1) |
+| `CLUSTER BY (date_key, customer_key)` on `fact_sales` | `gold_fact_sales.sql` | 38–56 % fewer bytes for date / customer filters at x10 |
+| daily_sales aggregates the fact before joining the calendar | `gold_daily_sales.sql` | −26.3 % at x10 (+6.6 % ≈ 0.15 s at x1) |
+| monthly_country_sales without the dim_date join | `gold_monthly_country_sales.sql` | −23.3 % at x10 (within noise at x1) |
+
+Rule used: adopt a change if it is clearly better at x10 and costs at most ~1 s at x1
+(designing for growth). Not adopted: GROUP BY de-dup (keeps the `not_duplicate` expectation
+and its DQ count), partitioning, broadcast hints, hand-written MERGE (declarative CDC is the
+pipeline-native route). Phase 1 versions of the two rewritten queries are frozen in
+`src/optimisation/phase1_sql/` so the benchmark baseline still measures Phase 1.
+
+**Same data as Phase 1** (fingerprints of all 10 production tables vs the Phase 1 copies): `<<§8a>>`.
+fact_sales clustering columns after the update: `<<§8a>>`; `silver_staged` not published: `<<§8a>>`.
+
+**Pipeline run time, full refresh, before vs after** (event log, median of `<<n>>` updates each;
+one-sample-per-update confirmation on the x1 data, where little gain is expected):
+
+| Flow | Before s | After s | % change |
+|---|---:|---:|---:|
+| `<<from notebook §8b>>` | | | |
 
 ## 5. Evidence
 
-Screenshots in `docs/img/` (EXPLAIN plans and query profiles), referenced per change.
+Screenshots in `docs/img/`:
+
+| File | Shows |
+|---|---|
+| `pipeline_graph_after.png` | Pipeline graph after 2.6: `silver_staged` as a (private) materialized view feeding sales and returns |
+| `fact_sales_clustering.png` | Catalog Explorer → `retail.gold.fact_sales` → Details: clustering columns `date_key, customer_key` |
+| `query_profile_pruning.png` | Query profile of the x10 month query on `lc_auto`: files read vs pruned |
+| `plan_broadcast_runtime_filter.png` | §6d plan: `PhotonBroadcastHashJoin` + `hashedrelationcontains` runtime filter |
+
+Text evidence in the notebook: plan summaries (§6b), the full monthly plan (§6d), I/O metrics
+from `system.query.history` (§5d), every timing in `retail.bench.benchmark_runs`.
 
 ## 6. What didn't help, and limits of these results
 
