@@ -16,7 +16,8 @@
 # MAGIC | 3 | **Preprocessing**: feature choice, log transforms, correlation pruning, clipping, scaling |
 # MAGIC | 4 | **Model selection**: KMeans / bisecting k-means / GMM for k = 2..10, every run in MLflow |
 # MAGIC | 5 | **Stability**: seeds + bootstrap samples compared with the adjusted Rand index; final model choice |
-# MAGIC | 6+ | Interpretation and outputs (added in the next step) |
+# MAGIC | 6 | **Final model and profiles**: refit the chosen model, stable segment ids, profile per segment |
+# MAGIC | 7+ | Names, actions, `gold.customer_segments`, docs (added in the next step) |
 # MAGIC
 # MAGIC Logic lives in `src/features/` and `src/segmentation/` (unit-tested); this notebook runs it
 # MAGIC and explains each decision.
@@ -601,8 +602,8 @@ BISECTING_IMPL = "spark_ml" if str(_probe_bkm).startswith("ok") else "kmeans_spl
 
 # Set RUN_SWEEP = False once a sweep is recorded and paste its run id below: the results are
 # then reloaded from MLflow instead of refitting 27 models.
-RUN_SWEEP = True
-SWEEP_RUN_ID = None
+RUN_SWEEP = False
+SWEEP_RUN_ID = "6fc3f33df1ff4880927d01f3faf92071"  # recorded 2026-11-24
 print("bisecting implementation:", BISECTING_IMPL)
 
 # COMMAND ----------
@@ -813,8 +814,8 @@ MIN_ARI = 0.8
 SIL_TOLERANCE = 0.01
 
 # Same pattern as section 4: set RUN_STABILITY = False and paste the run id once recorded.
-RUN_STABILITY = True
-STABILITY_RUN_ID = None
+RUN_STABILITY = False
+STABILITY_RUN_ID = "fd5c99e7c17742f6a2745ef2d479b270"  # recorded 2026-11-25
 
 # COMMAND ----------
 
@@ -933,5 +934,255 @@ for r in stab_table.to_dict("records"):
         f"| {r['algorithm']} | {r['k']} | "
         + " | ".join("" if r[c] is None else f"{r[c]:.4f}" for c in scols)
         + f" | {r['error'] or ''} |"
+    )
+print("\n".join(lines))
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6. Final model and segment profiles
+# MAGIC
+# MAGIC Section 5 chose **KMeans, k = 3** by the rule set in advance. Two caveats from the numbers,
+# MAGIC both checked below rather than argued away:
+# MAGIC
+# MAGIC - It passed bootstrap stability only just (mean ARI 0.8007 vs threshold 0.8, min 0.71).
+# MAGIC - Bisecting k-means, k = 3 was more stable (0.88 / 0.85) with silhouette 0.456 vs 0.474.
+# MAGIC
+# MAGIC So 6.2 measures how much the two 3-segment solutions **agree**: if they put customers in
+# MAGIC largely the same groups, the three segments are real structure in the data, not a product
+# MAGIC of one algorithm. KMeans k = 4 (same silhouette) was rejected: seed ARI 0.62, min 0.38, so
+# MAGIC its 4th segment moves from run to run.
+# MAGIC
+# MAGIC **The model is JSON, not a saved Spark model.** `SegmentModel` = preprocessing parameters
+# MAGIC + 3 centres. Scoring = preprocess + nearest centre, so Phase 6 can score new snapshots
+# MAGIC without loading a Spark ML model (saving/loading models is what breaks on Free Edition for
+# MAGIC BisectingKMeans). **Segment ids are ordered by value**: segment 0 has the highest
+# MAGIC monetary centre. KMeans' own numbering is arbitrary and can swap between refits; names
+# MAGIC are attached by profile in section 7, never by raw cluster number.
+
+# COMMAND ----------
+
+from segmentation.bisecting import assign as bisecting_assign
+from segmentation.bisecting import fit_bisecting
+from segmentation.metrics import silhouette
+from segmentation.plots import centroid_heatmap
+from segmentation.profiling import (
+    PROFILE_FEATURES,
+    SEGMENT_COL,
+    fit_segment_model,
+    overall_profile,
+    segment_profile,
+)
+from segmentation.stability import adjusted_rand_index
+
+assert FINAL["algorithm"] == "kmeans", (
+    "fit_segment_model refits KMeans; extend it for other algorithms"
+)
+FINAL_K = FINAL["k"]
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6.1 Refit and check it reproduces the sweep
+# MAGIC
+# MAGIC Same data, features, k and seed as the sweep trial, so the silhouette must match it.
+
+# COMMAND ----------
+
+seg_model = fit_segment_model(prepared, pp, FINAL_K, SEED)
+assigned = seg_model.assign_prepared(prepared)  # z columns + features vector + segment_id
+refit_silhouette = silhouette(assigned, "features", SEGMENT_COL)
+print(f"refit silhouette {refit_silhouette:.6f} vs sweep {FINAL['silhouette']:.6f}")
+assert abs(refit_silhouette - FINAL["silhouette"]) < 1e-6, (
+    "refit does not reproduce the sweep trial"
+)
+
+segmented = customers.join(assigned.select("customer_id", SEGMENT_COL), "customer_id")
+assert segmented.count() == checks["customers"]
+print("centres (rows = segments, ordered by monetary):")
+for sid, c in enumerate(seg_model.centers):
+    print(sid, {f: round(v, 3) for f, v in zip(seg_model.features, c, strict=True)})
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6.2 Agreement with bisecting k-means (k = 3)
+# MAGIC
+# MAGIC ARI between the final KMeans segments and bisecting k-means' 3 segments on the same
+# MAGIC customers, plus the cross-tab: which bisecting cluster each KMeans segment's customers
+# MAGIC land in.
+
+# COMMAND ----------
+
+bk_splits = fit_bisecting(prepared, FINAL_K, Z_COLS, SEED)
+bk = bisecting_assign(prepared, bk_splits, Z_COLS, k=FINAL_K, label_col="bisecting_cluster")
+pairs = assigned.select("customer_id", SEGMENT_COL).join(
+    bk.select("customer_id", "bisecting_cluster"), "customer_id"
+)
+pair_rows = pairs.orderBy("customer_id").collect()
+ARI_VS_BISECTING = adjusted_rand_index(
+    [r[SEGMENT_COL] for r in pair_rows], [r["bisecting_cluster"] for r in pair_rows]
+)
+print(f"ARI(final KMeans, bisecting k={FINAL_K}) = {ARI_VS_BISECTING:.4f}")
+crosstab = (
+    pairs.groupBy(SEGMENT_COL).pivot("bisecting_cluster").count().fillna(0).orderBy(SEGMENT_COL)
+)
+display(crosstab)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6.3 Segment profiles
+# MAGIC
+# MAGIC Per segment: size, revenue share, mean and median of every feature (including the
+# MAGIC profile-only ones such as basket value, interval and return rate), and the share of
+# MAGIC customers with notable properties. The **index** table divides each segment's median by
+# MAGIC the all-customer median (100 = typical customer), the easiest way to read the differences.
+# MAGIC The centroid heatmap shows the same thing on the scaled axes the model actually used.
+
+# COMMAND ----------
+
+profile_pd = segment_profile(segmented).toPandas()
+overall = overall_profile(customers)
+display(profile_pd)
+
+index_rows = []
+for f in PROFILE_FEATURES:
+    base = overall[f"median_{f}"]
+    row = {"feature": f, "all_customers_median": base}
+    for _, p in profile_pd.iterrows():
+        v = p[f"median_{f}"]
+        row[f"seg{int(p[SEGMENT_COL])}_median"] = v
+        row[f"seg{int(p[SEGMENT_COL])}_index"] = (
+            None if v is None or base in (None, 0) or pd.isna(v) else round(100 * v / base)
+        )
+    index_rows.append(row)
+index_pd = pd.DataFrame(index_rows)
+display(index_pd)
+
+seg_labels = [f"segment {i}" for i in range(FINAL_K)]
+fig_centres = centroid_heatmap(
+    seg_model.centers, seg_model.features, seg_labels, f"Segment centres, KMeans k={FINAL_K}"
+)
+fig_sizes = share_bars(
+    {f"seg {int(r[SEGMENT_COL])}": r["customer_share"] for _, r in profile_pd.iterrows()},
+    "Share of customers",
+)
+fig_revenue = share_bars(
+    {f"seg {int(r[SEGMENT_COL])}": r["revenue_share"] for _, r in profile_pd.iterrows()},
+    "Share of revenue",
+)
+display(fig_centres)
+display(fig_sizes)
+display(fig_revenue)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6.4 Log the final model to MLflow
+
+# COMMAND ----------
+
+sweep_row = next(r for r in rows if (r["algorithm"], r["k"]) == ("kmeans", FINAL_K))
+mlflow.set_experiment(EXPERIMENT_PATH)
+with mlflow.start_run(run_name=f"final_kmeans_k{FINAL_K}") as final_run:
+    mlflow.set_tags(
+        {
+            "phase": "3",
+            "kind": "final_model",
+            "algorithm": "kmeans",
+            "sweep_run_id": SWEEP_RUN_ID,
+            "stability_run_id": STABILITY_RUN_ID,
+        }
+    )
+    mlflow.log_params(
+        {
+            **common_params,
+            "algorithm": "kmeans",
+            "k": FINAL_K,
+            "seed": SEED,
+            "order_by": seg_model.order_by,
+        }
+    )
+    mlflow.log_metrics(
+        {
+            "silhouette": refit_silhouette,
+            "wcss": sweep_row["wcss"],
+            "min_share": sweep_row["min_share"],
+            "seed_ari_mean": FINAL["seed_ari_mean"],
+            "bootstrap_ari_mean": FINAL["bootstrap_ari_mean"],
+            "ari_vs_bisecting": ARI_VS_BISECTING,
+        }
+    )
+    mlflow.log_dict(seg_model.to_dict(), "model/segment_model.json")
+    mlflow.log_text(profile_pd.to_csv(index=False), "profiles/segment_profile.csv")
+    mlflow.log_text(index_pd.to_csv(index=False), "profiles/segment_index.csv")
+    mlflow.log_text(crosstab.toPandas().to_csv(index=False), "profiles/crosstab_vs_bisecting.csv")
+    mlflow.log_figure(fig_centres, "profiles/centroid_heatmap.png")
+    mlflow.log_figure(fig_sizes, "profiles/segment_sizes.png")
+    mlflow.log_figure(fig_revenue, "profiles/revenue_share.png")
+FINAL_RUN_ID = final_run.info.run_id
+print("final model run:", FINAL_RUN_ID)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6.5 Summary to paste back into the chat
+
+# COMMAND ----------
+
+
+def _v(x, nd=3):
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return ""
+    return f"{x:,.{nd}f}" if isinstance(x, float) else str(x)
+
+
+segs = [int(r[SEGMENT_COL]) for _, r in profile_pd.iterrows()]
+lines = [
+    "### Phase 3.5a results",
+    "",
+    f"- final model run: {FINAL_RUN_ID}",
+    f"- refit silhouette: {refit_silhouette:.4f}",
+    f"- ARI vs bisecting k={FINAL_K}: {ARI_VS_BISECTING:.4f}",
+    f"- crosstab (rows = segment_id, cols = bisecting cluster): {[tuple(r) for r in crosstab.collect()]}",
+    "- centres (z): "
+    + str(
+        {
+            i: {f: round(v, 3) for f, v in zip(seg_model.features, c, strict=True)}
+            for i, c in enumerate(seg_model.centers)
+        }
+    ),
+    "",
+    "| metric | " + " | ".join(f"seg {s}" for s in segs) + " |",
+    "|---|" + "---|" * len(segs),
+]
+summary_metrics = [
+    "customers",
+    "customer_share",
+    "revenue",
+    "revenue_share",
+    "revenue_per_customer",
+    "pct_one_invoice",
+    "pct_with_returns",
+    "pct_uk",
+    "pct_tenure_censored",
+    "pct_first_bought_last_90d",
+    "pct_bought_last_90d",
+]
+summary_metrics += [f"{s}_{f}" for f in PROFILE_FEATURES for s in ("median", "mean")]
+for m in summary_metrics:
+    lines.append(f"| {m} | " + " | ".join(_v(r[m]) for _, r in profile_pd.iterrows()) + " |")
+lines += [
+    "",
+    "| feature | all median | " + " | ".join(f"seg {s} index" for s in segs) + " |",
+    "|---|---|" + "---|" * len(segs),
+]
+for r in index_rows:
+    lines.append(
+        f"| {r['feature']} | {_v(r['all_customers_median'])} | "
+        + " | ".join(_v(r.get(f"seg{s}_index")) for s in segs)
+        + " |"
     )
 print("\n".join(lines))

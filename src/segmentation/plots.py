@@ -118,3 +118,29 @@ def ari_bars(rows, threshold: float, title: str):
     ax.legend(fontsize=8, loc="upper left", bbox_to_anchor=(1.01, 1.0))
     fig.tight_layout()
     return fig
+
+
+def centroid_heatmap(centers, features, segment_labels, title: str):
+    """Segment centres on the standardised scale: 0 = average customer, +1 = one sd above."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(1.3 * len(features) + 2.5, 0.7 * len(centers) + 1.8))
+    lim = max(1.0, max(abs(v) for c in centers for v in c))
+    im = ax.imshow(centers, cmap="RdBu_r", vmin=-lim, vmax=lim, aspect="auto")
+    ax.set_xticks(range(len(features)), labels=features, rotation=35, ha="right")
+    ax.set_yticks(range(len(centers)), labels=segment_labels)
+    for i, row in enumerate(centers):
+        for j, v in enumerate(row):
+            ax.text(
+                j,
+                i,
+                f"{v:+.2f}",
+                ha="center",
+                va="center",
+                fontsize=9,
+                color="white" if abs(v) > 0.6 * lim else "black",
+            )
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="sd from average (after log/clip)")
+    ax.set_title(title)
+    fig.tight_layout()
+    return fig
