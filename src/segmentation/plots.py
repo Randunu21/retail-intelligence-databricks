@@ -35,3 +35,53 @@ def correlation_heatmap(corr: Mapping[tuple[str, str], float], columns: Sequence
     ax.set_title(title)
     fig.tight_layout()
     return fig
+
+
+def metric_by_k(rows, metric: str, ylabel: str, title: str, marks: dict | None = None):
+    """One line per algorithm (rows = flat result dicts). `marks` = {algorithm: k} to circle."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    for algo in sorted({r["algorithm"] for r in rows}):
+        pts = sorted(
+            (r["k"], r[metric])
+            for r in rows
+            if r["algorithm"] == algo and r.get(metric) is not None and not r.get("error")
+        )
+        if not pts:
+            continue
+        ks, vs = zip(*pts, strict=True)
+        (line,) = ax.plot(ks, vs, marker="o", label=algo)
+        if marks and marks.get(algo) in ks:
+            k = marks[algo]
+            ax.scatter(
+                [k],
+                [dict(pts)[k]],
+                s=180,
+                facecolors="none",
+                edgecolors=line.get_color(),
+                linewidths=2,
+            )
+    ax.set_xlabel("k (number of segments)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def share_bars(shares_by_label: dict, title: str):
+    """Bar chart of segment shares, {label: share}."""
+    import matplotlib.pyplot as plt
+
+    labels = [str(k) for k in shares_by_label]
+    values = [100 * v for v in shares_by_label.values()]
+    fig, ax = plt.subplots(figsize=(max(5, 0.9 * len(labels) + 2), 3.5))
+    bars = ax.bar(labels, values, color="#4C72B0")
+    ax.bar_label(bars, labels=[f"{v:.1f}%" for v in values], fontsize=8)
+    ax.set_ylabel("% of customers")
+    ax.set_title(title)
+    ax.margins(y=0.15)
+    fig.tight_layout()
+    return fig

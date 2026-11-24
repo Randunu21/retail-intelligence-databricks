@@ -14,7 +14,8 @@
 # MAGIC | 1 | **Free Edition probe**: Spark ML on serverless, MLflow experiment, Feature Engineering client |
 # MAGIC | 2 | **Customer feature table** `retail.ml.customer_features` (feature table in Unity Catalog) |
 # MAGIC | 3 | **Preprocessing**: feature choice, log transforms, correlation pruning, clipping, scaling |
-# MAGIC | 4+ | Model selection, stability, interpretation (added in later steps) |
+# MAGIC | 4 | **Model selection**: KMeans / bisecting k-means / GMM for k = 2..10, every run in MLflow |
+# MAGIC | 5+ | Stability, interpretation, outputs (added in later steps) |
 # MAGIC
 # MAGIC Logic lives in `src/features/` and `src/segmentation/` (unit-tested); this notebook runs it
 # MAGIC and explains each decision.
@@ -546,4 +547,223 @@ for f in CLUSTER_FEATURES:
     lines.append(
         f"| {f} | {pp.lower[f]:.4f} | {pp.upper[f]:.4f} | {pp.mean[f]:.4f} | {pp.std[f]:.4f} |"
     )
+print("\n".join(lines))
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4. Model selection: three algorithms, k = 2..10
+# MAGIC
+# MAGIC **Why cluster at all, instead of RFM scoring rules?** Classic RFM gives each customer a
+# MAGIC 1-5 score per dimension (quintiles) and maps score combinations to names with
+# MAGIC hand-written rules (e.g. R>=4 and F>=4 -> Champions). It's transparent and needs no
+# MAGIC model, but the cut-offs are arbitrary, it uses only 3 dimensions, and 125 score cells must
+# MAGIC be grouped by hand. Clustering finds the groups from the data across all 6 features (incl.
+# MAGIC tenure and seasonality); we still give the clusters RFM-style business names (section 6).
+# MAGIC Interview answer: rules when the business wants fixed, explainable definitions; clustering
+# MAGIC to *discover* structure, then name it.
+# MAGIC
+# MAGIC | Algorithm | Assigns | Good at | Watch out for |
+# MAGIC |---|---|---|---|
+# MAGIC | KMeans | hard, nearest centroid | fast; centroids are easy-to-read segment "prototypes" | assumes round, similar-size clusters; result depends on the random start |
+# MAGIC | Bisecting k-means | hard, top-down splits | a hierarchy (k=4 refines k=3); less start-dependent | greedy: an early bad split is never undone |
+# MAGIC | Gaussian mixture | soft (probability per segment) | elliptical, different-size clusters; assignment confidence | many more parameters; can collapse onto piles of identical points (we have them: 1,618 one-invoice customers) |
+# MAGIC
+# MAGIC **Free Edition:** Spark ML `BisectingKMeans` fails here (`DBFS_DISABLED`, probe 1a), so
+# MAGIC bisecting k-means is implemented with Spark `KMeans(k=2)` splits in
+# MAGIC `src/segmentation/bisecting.py` (same algorithm; the split sequence is the model).
+# MAGIC
+# MAGIC **How k is chosen** (same rules for every algorithm, all on the same preprocessed space):
+# MAGIC 1. **Silhouette** (separation, higher is better) as the main score;
+# MAGIC 2. the **elbow** of WCSS (within-cluster sum of squares) as a cross-check;
+# MAGIC 3. every segment must hold at least **3%** of customers (~175 people) to be worth a campaign;
+# MAGIC 4. **k >= 3**: k = 2 ("high value vs the rest") usually separates best but is too coarse.
+# MAGIC
+# MAGIC The final choice also needs **stability** (section 5): a segmentation that changes with the
+# MAGIC random seed can't be used for campaigns.
+
+# COMMAND ----------
+
+from segmentation.clustering import ALGORITHMS, run_sweep
+from segmentation.metrics import elbow_k, suggest_k
+from segmentation.plots import metric_by_k, share_bars
+from segmentation.tracking import log_trial, results_table
+
+KS = list(range(2, 11))
+SEED = 42
+MIN_SHARE = 0.03
+K_MIN = 3
+# From probe 1a; Free Edition fails Spark's BisectingKMeans -> KMeans-split implementation.
+_probe_bkm = globals().get("probe", {}).get("spark_ml_bisecting_kmeans", "FAILED")
+BISECTING_IMPL = "spark_ml" if str(_probe_bkm).startswith("ok") else "kmeans_splits"
+
+# Set RUN_SWEEP = False once a sweep is recorded and paste its run id below: the results are
+# then reloaded from MLflow instead of refitting 27 models.
+RUN_SWEEP = True
+SWEEP_RUN_ID = None
+print("bisecting implementation:", BISECTING_IMPL)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.1 Run the sweep (one parent MLflow run, one nested run per algorithm x k)
+# MAGIC
+# MAGIC 3 algorithms x 9 values of k = 27 child runs, each with params (algorithm, k, seed,
+# MAGIC implementation, features, preprocessing run id), metrics (silhouette, WCSS, min/max
+# MAGIC share, empty clusters, GMM confidence, seconds) and the cluster shares + model
+# MAGIC parameters as JSON. Expect several minutes on serverless.
+
+# COMMAND ----------
+
+common_params = {
+    "as_of_date": str(AS_OF),
+    "cluster_features": ",".join(CLUSTER_FEATURES),
+    "preprocess_run_id": PREPROCESS_RUN_ID,
+    "n_customers": checks["customers"],
+}
+
+
+def log_and_print(r):
+    """Called after every trial: nested MLflow run + one progress line."""
+    log_trial(r, common_params)
+    sil = r.metrics.get("silhouette")
+    print(
+        f"{r.algorithm:17s} k={r.k:2d} silhouette={sil if sil is None else round(sil, 4)} "
+        f"min_share={round(r.metrics.get('min_share', 0), 4)} error={r.error}"
+    )
+
+
+if RUN_SWEEP:
+    mlflow.set_experiment(EXPERIMENT_PATH)
+    with mlflow.start_run(run_name="k_sweep") as sweep_run:
+        mlflow.set_tags({"phase": "3", "kind": "k_sweep", "bisecting_impl": BISECTING_IMPL})
+        mlflow.log_params(
+            {
+                **common_params,
+                "ks": f"{KS[0]}-{KS[-1]}",
+                "seed": SEED,
+                "min_share": MIN_SHARE,
+                "k_min": K_MIN,
+            }
+        )
+        trials = run_sweep(
+            prepared,
+            Z_COLS,
+            KS,
+            ALGORITHMS,
+            seed=SEED,
+            bisecting_impl=BISECTING_IMPL,
+            on_result=log_and_print,
+        )
+        sweep_results = [t.to_dict() for t in trials]
+        mlflow.log_dict({"results": sweep_results}, "sweep/results.json")
+    SWEEP_RUN_ID = sweep_run.info.run_id
+else:
+    sweep_results = mlflow.artifacts.load_dict(f"runs:/{SWEEP_RUN_ID}/sweep/results.json")[
+        "results"
+    ]
+print("sweep run:", SWEEP_RUN_ID, "| trials:", len(sweep_results))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.2 Compare: silhouette, elbow, segment sizes
+
+# COMMAND ----------
+
+import pandas as pd
+
+rows = results_table(sweep_results)
+table = pd.DataFrame(rows).sort_values(["algorithm", "k"])
+display(table)
+
+suggested = {a: suggest_k(sweep_results, a, MIN_SHARE, K_MIN) for a in ALGORITHMS}
+elbows = {}
+for a in ALGORITHMS:
+    ok = sorted((r["k"], r["wcss"]) for r in rows if r["algorithm"] == a and not r["error"])
+    elbows[a] = elbow_k([k for k, _ in ok], [w for _, w in ok]) if ok else None
+print("silhouette-best k (min share, k>=3):", suggested)
+print("WCSS elbow k                       :", elbows)
+
+fig_sil = metric_by_k(
+    rows,
+    "silhouette",
+    "silhouette (squared Euclidean)",
+    "Silhouette by k (circled = suggested k)",
+    marks=suggested,
+)
+fig_wcss = metric_by_k(
+    rows, "wcss", "WCSS", "Elbow: within-cluster sum of squares by k", marks=elbows
+)
+fig_min = metric_by_k(rows, "min_share", "smallest segment share", "Smallest segment by k")
+display(fig_sil)
+display(fig_wcss)
+display(fig_min)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.3 Segment sizes at each algorithm's suggested k, and logging the comparison
+
+# COMMAND ----------
+
+size_figs = {}
+for a, k in suggested.items():
+    if k is None:
+        continue
+    trial = next(r for r in sweep_results if r["algorithm"] == a and r["k"] == k)
+    shares = {int(c): v for c, v in trial["shares"].items()}
+    size_figs[a] = share_bars(dict(sorted(shares.items())), f"{a}, k={k}: segment sizes")
+    display(size_figs[a])
+
+with mlflow.start_run(run_id=SWEEP_RUN_ID):
+    mlflow.log_figure(fig_sil, "sweep/silhouette_by_k.png")
+    mlflow.log_figure(fig_wcss, "sweep/elbow_wcss_by_k.png")
+    mlflow.log_figure(fig_min, "sweep/min_share_by_k.png")
+    for a, fig in size_figs.items():
+        mlflow.log_figure(fig, f"sweep/segment_sizes_{a}_k{suggested[a]}.png")
+    mlflow.log_dict({"suggested_k": suggested, "elbow_k": elbows}, "sweep/suggestions.json")
+    mlflow.log_text(table.to_csv(index=False), "sweep/results_table.csv")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.4 Summary to paste back into the chat
+
+# COMMAND ----------
+
+cols = [
+    "silhouette",
+    "wcss",
+    "min_share",
+    "max_share",
+    "n_empty_clusters",
+    "mean_max_probability",
+    "fit_eval_seconds",
+]
+lines = [
+    "### Phase 3.3 results",
+    "",
+    f"- sweep run: {SWEEP_RUN_ID}",
+    f"- bisecting implementation: {BISECTING_IMPL}",
+    f"- suggested k (silhouette, min share {MIN_SHARE}, k>={K_MIN}): {suggested}",
+    f"- elbow k: {elbows}",
+]
+errors = [(r["algorithm"], r["k"], r["error"]) for r in rows if r["error"]]
+lines.append(f"- errors: {errors or 'none'}")
+lines += ["", "| algorithm | k | " + " | ".join(cols) + " |", "|---|---|" + "---|" * len(cols)]
+for r in sorted(rows, key=lambda r: (r["algorithm"], r["k"])):
+    vals = [r.get(c) for c in cols]
+    lines.append(
+        f"| {r['algorithm']} | {r['k']} | "
+        + " | ".join(
+            "" if v is None else f"{v:.4f}" if isinstance(v, float) else str(v) for v in vals
+        )
+        + " |"
+    )
+for a, k in suggested.items():
+    if k is not None:
+        t = next(r for r in sweep_results if r["algorithm"] == a and r["k"] == k)
+        lines.append(f"- shares {a} k={k}: { {c: round(v, 4) for c, v in t['shares'].items()} }")
 print("\n".join(lines))
