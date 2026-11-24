@@ -100,7 +100,12 @@ def before_after(updates: DataFrame, flows: DataFrame, change_ts: datetime | str
         "after"
     )
     labelled = ok.withColumn("period", period).select("update_id", "period", "run_s")
-    per_flow = flows.join(labelled, "update_id").select("flow", "period", "duration_s")
+    # Events not tied to a dataset (shown as "missingFlowName") have no duration: skip them.
+    per_flow = (
+        flows.filter(F.col("duration_s").isNotNull())
+        .join(labelled, "update_id")
+        .select("flow", "period", "duration_s")
+    )
     whole = labelled.select(F.lit("(update run_s)").alias("flow"), "period",
                             F.col("run_s").alias("duration_s"))  # fmt: skip
     stats = (

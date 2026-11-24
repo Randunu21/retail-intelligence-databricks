@@ -319,6 +319,8 @@ print("x1 baseline run_id:", BASELINE_X1_RUN_ID)
 # MAGIC If the notebook rebuild didn't produce exactly the production tables, its timings would
 # MAGIC say nothing about the pipeline. `fingerprint` = row count + an order-independent
 # MAGIC checksum of every value. Every row below must show `match = true`.
+# MAGIC `_ingested_at` (Bronze load time) is left out: any full refresh of the pipeline re-ingests
+# MAGIC Bronze and gives it a new value, which says nothing about the data.
 
 # COMMAND ----------
 
@@ -328,9 +330,7 @@ checks = []
 # can never match between two builds. Drop it and compare every business column.
 for step in BASELINE_STEPS:
     prod = fingerprint(spark.read.table(PROD_NAMES[step.name]).drop("_ingested_at")).first()
-    bench = fingerprint(
-        spark.read.table(baseline_x1.names[step.name]).drop("_ingested_at")
-    ).first()
+    bench = fingerprint(spark.read.table(baseline_x1.names[step.name]).drop("_ingested_at")).first()
     checks.append(
         {
             "table": step.name,
@@ -1239,7 +1239,10 @@ print(
 # MAGIC ### 8a. Same data as Phase 1?
 # MAGIC The x1 baseline copies (`retail.bench.x1_baseline__*`) were built with Phase 1 logic and match
 # MAGIC Phase 1 production (§3a). After a pipeline update with the new code, every production table
-# MAGIC must still match them.
+# MAGIC must still match them. Two lessons from running this (fixed on 2026-11-24):
+# MAGIC - a full refresh re-ingests Bronze, so `_ingested_at` changes and is excluded from the check
+# MAGIC   (same in §3a);
+# MAGIC - `DESCRIBE DETAIL` doesn't work on a pipeline materialized view by name; its backing table does.
 
 # COMMAND ----------
 

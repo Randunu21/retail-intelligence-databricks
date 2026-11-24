@@ -1,14 +1,35 @@
 # Pipeline optimisation report (Phase 2)
 
-> Every number in this report comes from `retail.bench.benchmark_runs` (real runs on
-> Databricks Free Edition, serverless). `<<PLACEHOLDER>>` = not measured yet.
-> Where a change made no measurable difference, the table says so.
+> Every number in this report comes from real runs on Databricks Free Edition (serverless):
+> timings in `retail.bench.benchmark_runs`, I/O in `retail.bench.benchmark_query_metrics`,
+> pipeline runs in the pipeline event log. Where a change made no measurable difference, the
+> report says so. "x10" always means the synthetic 10× replica of the real data (§3).
+
+## Summary
+
+- **Method:** each Silver/Gold table rebuilt with the pipeline's own code in a scratch schema;
+  1 warm-up + 3–5 measured runs, interleaved, median reported; a change counts only if the
+  min–max ranges don't overlap; every variant proven to produce identical data (checksums).
+- **At the real size (~1M rows) the build is overhead-bound:** every Gold table costs 2.5–3.6 s
+  whatever its size, and each table is one file, so most optimisations can't show a gain.
+- **On the 10× replica (10.7M rows):**
+  - Silver staging once instead of twice: **−20 %** compute for Silver.
+  - Two Gold query rewrites (aggregate before joining; drop an unneeded join): **−26 % / −23 %**.
+  - Liquid clustering of `fact_sales` on `(date_key, customer_key)`: date and customer queries
+    read **38–56 % fewer bytes**; partitioning by day was rejected (604 tiny files, 3× slower
+    build, up to 7× more bytes for other queries).
+  - Incremental loading (`MERGE` + Change Data Feed): a monthly increment costs **about half** a
+    full rebuild (25–29 s vs 58.7 s), produces identical tables and is safe to re-run.
+- **Applied to the pipeline:** clustering, staging once, both rewrites. Same data as Phase 1
+  for all 10 tables. On the real data the pipeline run got ~3.6 s slower (26.7 → 30.2 s, 2 runs
+  each): staging once adds a sequential step and clustering adds ~1 s of write time. Kept as a
+  design-for-growth trade-off (§4.5, §6).
 
 ## 1. Setup
 
 | Item | Value |
 |---|---|
-| Platform | Databricks Free Edition, serverless notebooks (Spark `<<SPARK_VERSION>>`) |
+| Platform | Databricks Free Edition, serverless notebooks and serverless Lakeflow pipeline (Spark 4.2 environment recorded in Phase 0; each run's version is stored in `benchmark_runs.spark_version`) |
 | Data (x1, real) | UCI Online Retail II: Bronze 1,067,371 rows → Silver sales 1,003,357 / returns 17,915 |
 | Data (x10, synthetic) | 10,673,710 Bronze rows: the real data replicated 10× with shifted customer/invoice keys (see §3). Labelled synthetic everywhere it's used. |
 | What is timed | Rebuild of each Silver/Gold table with the pipeline's own code (`CREATE OR REPLACE`), wall clock on the driver |
@@ -304,7 +325,9 @@ Initial load (Bronze before 2011-10-01, a normal full build of the 5 tables): 72
   817,270 new rows added only ~3.5 s. So a daily batch (~1/30 of a month) would cost close to
   that ~17 s floor, while a full rebuild keeps growing with history: the gap widens over time.
 - Full rebuild = sum of the x10 baseline medians for the same 5 tables, from run
-  `<<BASELINE_XN_RUN_ID>>`; increments are single runs (a batch can only be loaded once).
+  `3b3aebbf-e074-44cc-a4fe-8f7361a2d829` (a later re-run of the §3 x10 baseline; its total for
+  these 5 tables, 58.737 s, is within 0.7 % of run 39753a7e's 58.344 s); increments are single
+  runs (a batch can only be loaded once).
 - In a Lakeflow pipeline, Databricks recommends declarative CDC (`APPLY CHANGES` / AUTO CDC)
   over hand-written MERGE; this notebook shows the mechanism that those features automate.
 - Locally (pytest) the same loader code runs against an in-memory imitation of MERGE/CDF and
@@ -315,11 +338,11 @@ Initial load (Bronze before 2011-10-01, a normal full build of the 5 tables): 72
 
 | # | Change | Why | Metric | Before | After | % change | Beyond noise? |
 |---|---|---|---|---:|---:|---:|---|
-| 1 | Liquid clustering on `(date_key, customer_key)` + `OPTIMIZE` (x10) | Data skipping for date and customer filters | MB read: month / customer query | 16.58 / 52.82 | 10.31 / 23.04 | −38 % / −56 % | Deterministic I/O counts (single execution) |
+| 1 | Liquid clustering on `(date_key, customer_key)` + `OPTIMIZE` (x10) | Data skipping for date and customer filters | MB read: month / customer query | 16.58 / 52.82 | 10.31 / 23.04 | −38 % / −56 % | File counts identical across 2 probes; MB varied ≤ ~20 % |
 | 2 | Partitioning by `date_key` (compared, rejected) (x10) | Classic layout; tests over-partitioning | Build s; MB read customer / full scan | 5.551; 52.82 / 16.44 | 15.832; 115.42 / 115.56 | +185 %; +119 % / +603 % | Build: ranges don't overlap; I/O deterministic |
 | 3 | Broadcast hints for small dimensions (and MERGE hints to price auto-broadcast) (x10) | Avoid shuffling the big side | Gold join step s | 3.08–3.96 | 2.95–3.95 | −0.3 to −4.0 % (no change); MERGE: +7.9 to +50.6 % | Hints: no; MERGE: yes |
 | 4 | Fewer wide operations (x10): pre-aggregate before join (daily), drop a join (monthly), GROUP BY de-dup (Silver) | Less data through shuffles/joins | s | 3.889 / 3.958 / 46.776 | 2.868 / 3.035 / 43.726 | −26.3 % / −23.3 % / −6.5 % | Yes |
-| 5 | Stage Silver once: Delta table vs `cache()` (x10; x1 in brackets) | Typing + window de-dup ran twice | Silver (sales + returns) s | 46.776 (8.581) | 37.245 / 36.501 (9.459 / 9.573) | −20.4 / −22.0 % (+10.2 / +11.6 %) | Yes |
+| 5 | Stage Silver once: Delta table vs `cache()` (x10; x1 in brackets) | Typing + window de-dup ran twice | Silver (sales + returns) s | 46.776 (8.581) | 37.245 / 36.501 (9.459 / 9.573) | −20.4 / −22.0 % (+10.2 / +11.6 %) | Yes (sequential builds = total compute; see §4.5 for the pipeline, which runs sales and returns in parallel) |
 | 6 | Incremental `MERGE` + CDF instead of full rebuild (x10) | Only new rows are processed | s per monthly increment | 58.737 (full rebuild) | 25.429–28.877 | −50.8 to −56.7 % | Single runs per batch; equals full rebuild; re-run is a no-op |
 
 ### 4.5 Applied to the Lakeflow pipeline (step 2.6)
@@ -337,15 +360,44 @@ and its DQ count), partitioning, broadcast hints, hand-written MERGE (declarativ
 pipeline-native route). Phase 1 versions of the two rewritten queries are frozen in
 `src/optimisation/phase1_sql/` so the benchmark baseline still measures Phase 1.
 
-**Same data as Phase 1** (fingerprints of all 10 production tables vs the Phase 1 copies): `<<§8a>>`.
-fact_sales clustering columns after the update: `<<§8a>>`; `silver_staged` not published: `<<§8a>>`.
+**Same data as Phase 1: yes for all 10 production tables** (fingerprints vs the Phase 1 copies,
+excluding `_ingested_at`, which a full refresh resets because Bronze is re-ingested):
+silver sales 1,003,357 / returns 17,915, fact 1,003,357, dim_date 739, dim_product 4,725,
+dim_customer 5,853, daily 739, monthly 562, product_performance 4,725, cohort 325 rows.
+`fact_sales` clustering columns after the update: `date_key, customer_key` (1 file at x1).
+`silver_staged` is not published (`retail.bronze.silver_staged` and `retail.silver.silver_staged`
+don't exist), as `private=True` intends.
 
-**Pipeline run time, full refresh, before vs after** (event log, median of `<<n>>` updates each;
-one-sample-per-update confirmation on the x1 data, where little gain is expected):
+**Pipeline run time, full refresh, before vs after** (event log, median of 2 completed
+"Full refresh all" updates each, 2026-11-23; real x1 data):
 
-| Flow | Before s | After s | % change |
-|---|---:|---:|---:|
-| `<<from notebook §8b>>` | | | |
+| Flow | Before s | After s | % change | Reading |
+|---|---:|---:|---:|---|
+| (whole update, run time) | 26.659 | 30.244 | +13.4 % | slower: see below |
+| silver_staged (new) | – | 6.409 | – | staging, now computed once |
+| sales | 6.857 | 3.284 | −52.1 % | no longer stages Bronze itself |
+| returns | 6.250 | 2.609 | −58.3 % | no longer stages Bronze itself |
+| fact_sales | 4.123 | 5.098 | +23.6 % | clustering on write (2.3 measured +35 % write at x1) |
+| monthly_country_sales | 5.197 | 4.449 | −14.4 % | at the noise edge: "likely faster" |
+| daily_sales | 5.544 | 5.738 | +3.5 % | noise |
+| product_performance | 5.430 | 5.061 | −6.8 % | unchanged code: noise |
+| dim_customer | 4.035 | 4.543 | +12.6 % | unchanged code: noise |
+| dim_product | 4.037 | 4.281 | +6.0 % | unchanged code: noise |
+| dim_date | 3.916 | 4.148 | +5.9 % | unchanged code: noise |
+| customer_cohort_retention | 4.750 | 4.729 | −0.5 % | unchanged code: noise |
+| online_retail_transactions (Bronze) | 8.594 | 8.244 | −4.1 % | unchanged code: noise |
+
+- **Noise level:** flows whose code didn't change moved between −4 % and +13 %, so with 2
+  updates per side only larger, structural changes are meaningful.
+- **Less work, longer critical path:** Silver work fell from 13.1 s (sales 6.86 + returns 6.25,
+  each staging Bronze) to 12.3 s (staging 6.41 + 3.28 + 2.61). But the pipeline runs sales and
+  returns **in parallel**: before, the Silver wait was ~6.9 s; now staging must finish first,
+  ~6.4 + 3.3 = ~9.7 s. Together with ~1 s of clustering on `fact_sales`, the update took ~3.6 s
+  longer on the real data.
+- **Correction to §4.2:** the notebook built sales and returns one after the other, so its −20 %
+  is a saving in **total compute** (what serverless bills), not a guaranteed wall-clock saving
+  for the parallel pipeline. At small scale the extra sequential step costs ~3 s; the saved
+  duplicate work grows with the data. Kept, with this trade-off stated.
 
 ## 5. Evidence
 
@@ -363,8 +415,43 @@ from `system.query.history` (§5d), every timing in `retail.bench.benchmark_runs
 
 ## 6. What didn't help, and limits of these results
 
-`<<honest notes>>`
+- **Most gains need data larger than this dataset.** At ~1M rows every table is one file and
+  each build has a ~2.5 s fixed cost; layout and query changes are neutral or slightly negative
+  there. The x10 replica shows the direction; it's the real data repeated with relabelled keys
+  (same products, dates and patterns), and its Bronze compresses unrealistically well
+  (7.71 MB vs 5.61 MB at x1).
+- **Broadcast hints did nothing:** the optimiser already broadcast every small dimension.
+  Forcing sort-merge joins showed what that is worth (+8 to +51 % at x10).
+- **`lc_32mb` = `lc_auto`:** a 32 MB target file size changed nothing at ~140 MB.
+- **Partitioning hurt** everything except queries on its own key.
+- **GROUP BY de-dup (−6.5 %) was not adopted:** it would remove duplicates before the
+  `not_duplicate` expectation, losing that count from the DQ log.
+- **Measurement limits:** single serverless sessions, warm cache only (the disk cache can't be
+  cleared), 3–5 runs per point; I/O byte counts varied up to ~20 % between probes (file counts
+  didn't); pipeline before/after is 2 updates per side; incremental batches are single runs.
+- **Mistakes found and fixed along the way** (all in the notebook history): query-history
+  matching (statement text is the Python line under Spark Connect → query tags; a missing scale
+  in the tag mixed x1 and x10), a plan parser that didn't know Photon's node names, notebook
+  sessions holding old module versions (→ autoreload), `_ingested_at` changing on full refresh,
+  and `DESCRIBE DETAIL` not working on materialized views by name.
 
 ## 7. What I'd do differently on classic compute
 
-`<<filled at the end>>`
+Serverless decides cluster size, AQE, broadcast threshold and caching; on classic compute
+I'd also tune:
+
+- **Cluster sizing:** size workers to the Silver staging (the heaviest, shuffle-bound step):
+  enough total cores for ~2–3 tasks per core on the shuffle, memory-optimised nodes if spills
+  show up, autoscaling with a sensible minimum, Photon on, spot workers for the batch pipeline.
+- **Shuffle partitions:** default 200 is far too many for ~1M rows and fine-ish for 10M; set
+  `spark.sql.shuffle.partitions` from shuffle size (~100–200 MB per partition) or leave AQE's
+  partition coalescing on (`spark.sql.adaptive.coalescePartitions.enabled`).
+- **AQE:** keep `spark.sql.adaptive.enabled` on; tune `skewJoin` thresholds if customer_key
+  skew appears (the Unknown customer −1 holds 22 % of lines); `autoBroadcastJoinThreshold`
+  raised to cover dimensions up to a few hundred MB if they grow.
+- **Caching:** `df.cache()` in memory for the shared Silver staging within one job, instead of
+  a stored intermediate, when the cluster has the memory.
+- **Maintenance:** schedule `OPTIMIZE` (and `VACUUM`) for clustered tables after loads, since
+  there is no predictive optimisation to do it automatically.
+- **Incremental by default:** Auto Loader into a streaming Silver with watermark-based de-dup,
+  or Lakeflow's declarative CDC (`AUTO CDC` / `APPLY CHANGES`), instead of full recomputes.

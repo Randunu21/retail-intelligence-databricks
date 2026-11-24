@@ -57,6 +57,7 @@ def log(spark):
             [("silver_staged", 5), ("retail.silver.sales", 3), ("retail.gold.fact_sales", 4)],
         )  # fmt: skip
         + update_events("u5", 400, True, [("retail.silver.sales", 50)], state="FAILED")
+        + [ev(305, "flow_progress", "u4", "missingFlowName", flow_progress={"status": "RUNNING"})]
     )
     return spark.createDataFrame(rows, SCHEMA)
 
@@ -87,3 +88,4 @@ def test_before_after_uses_completed_full_refreshes_only(log):
     assert sales.pct_change == pytest.approx(-72.7)
     assert rows["silver_staged"].n_before == 0 and rows["silver_staged"].n_after == 1
     assert rows["(update run_s)"].n_before == 2
+    assert "missingFlowName" not in rows  # no duration -> not compared
