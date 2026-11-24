@@ -38,6 +38,23 @@ GOLD_MONTHLY_COUNTRY_SALES = fq("gold", "monthly_country_sales")
 GOLD_PRODUCT_PERFORMANCE = fq("gold", "product_performance")
 GOLD_CUSTOMER_COHORT_RETENTION = fq("gold", "customer_cohort_retention")
 
+# ML (Phase 3+) ------------------------------------------------------------------------
+# Customer feature table: one row per (customer_id, as_of_date). The primary key makes it a
+# feature table in Unity Catalog; as_of_date is a TIMESERIES key so several snapshots can live
+# side by side (Phase 5 needs features "as of" a cutoff date, without leakage).
+ML_CUSTOMER_FEATURES = fq("ml", "customer_features")
+GOLD_CUSTOMER_SEGMENTS = fq("gold", "customer_segments")
+
+# MLflow experiment for customer segmentation, created under the user's workspace folder.
+SEGMENTATION_EXPERIMENT_NAME = "retail_customer_segmentation"
+
+
+def user_experiment_path(user_email: str, name: str = SEGMENTATION_EXPERIMENT_NAME) -> str:
+    """Workspace path of an MLflow experiment in the user's home folder,
+    e.g. /Users/me@example.com/retail_customer_segmentation."""
+    return f"/Users/{user_email}/{name}"
+
+
 # Benchmarks (Phase 2) -----------------------------------------------------------------
 # A separate scratch schema keeps experiment tables out of the production layers: every
 # benchmark copy can be dropped with one `DROP SCHEMA retail.bench CASCADE` at the end.
