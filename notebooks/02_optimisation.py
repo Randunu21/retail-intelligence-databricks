@@ -322,10 +322,15 @@ print("x1 baseline run_id:", BASELINE_X1_RUN_ID)
 
 # COMMAND ----------
 
+# DBTITLE 1,3a. Verify benchmark copies equal production
 checks = []
+# `_ingested_at` is the Bronze load time: a new constant on every Bronze re-ingest, so it
+# can never match between two builds. Drop it and compare every business column.
 for step in BASELINE_STEPS:
-    prod = fingerprint(spark.read.table(PROD_NAMES[step.name])).first()
-    bench = fingerprint(spark.read.table(baseline_x1.names[step.name])).first()
+    prod = fingerprint(spark.read.table(PROD_NAMES[step.name]).drop("_ingested_at")).first()
+    bench = fingerprint(
+        spark.read.table(baseline_x1.names[step.name]).drop("_ingested_at")
+    ).first()
     checks.append(
         {
             "table": step.name,
@@ -1238,17 +1243,34 @@ print(
 
 # COMMAND ----------
 
+# DBTITLE 1,8a. New pipeline vs Phase 1 data
 prod_checks = []
+# `_ingested_at` is the Bronze load time: a new constant on every Bronze re-ingest, so it
+# can never match between two builds. Drop it and compare every business column.
 for step in BASELINE_STEPS:
-    prod = fingerprint(spark.read.table(PROD_NAMES[step.name])).first()
-    phase1 = fingerprint(spark.read.table(baseline_x1.names[step.name])).first()
+    prod = fingerprint(spark.read.table(PROD_NAMES[step.name]).drop("_ingested_at")).first()
+    phase1 = fingerprint(
+        spark.read.table(baseline_x1.names[step.name]).drop("_ingested_at")
+    ).first()
     prod_checks.append(
         {"table": PROD_NAMES[step.name], "rows": prod.rows, "same_as_phase1": prod == phase1}
     )
 print(markdown_table(prod_checks, ["table", "rows", "same_as_phase1"]))
 assert all(c["same_as_phase1"] for c in prod_checks), "The new pipeline changed a table's data"
 
-fact_detail = describe_detail(spark, PROD_NAMES["gold_fact_sales"])
+# `fact_sales` is a pipeline materialized view; its physical layout lives on the
+# internal backing managed table, which is what DESCRIBE DETAIL can read.
+_cat, _schema, _tbl = PROD_NAMES["gold_fact_sales"].split(".")
+fact_backing = (
+    spark.sql(
+        "SELECT table_name FROM system.information_schema.tables "
+        f"WHERE table_catalog = '{_cat}' AND table_schema = '{_schema}' "
+        f"AND table_type = 'MANAGED' AND table_name LIKE '%{_tbl}%'"
+    )
+    .first()
+    .table_name
+)
+fact_detail = describe_detail(spark, f"{_cat}.{_schema}.`{fact_backing}`")
 print(
     "fact_sales clustering columns:",
     fact_detail.clustering_columns or "(none)",
@@ -1285,7 +1307,7 @@ print(
 # COMMAND ----------
 
 CHANGE_TS = (
-    "2026-11-22 00:00:00"  # <- set: after the last "before" update, before the first "after"
+    "2026-11-23 17:00:00"  # <- set: after the last "before" update, before the first "after"
 )
 
 cmp_pipeline = before_after(updates, flow_summary(events), CHANGE_TS)
