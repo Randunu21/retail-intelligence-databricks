@@ -13,7 +13,8 @@
 # MAGIC |---|---|
 # MAGIC | 1 | **Free Edition probe**: Spark ML on serverless, MLflow experiment, Feature Engineering client |
 # MAGIC | 2 | **Customer feature table** `retail.ml.customer_features` (feature table in Unity Catalog) |
-# MAGIC | 3+ | Preprocessing, model selection, stability, interpretation (added in later steps) |
+# MAGIC | 3 | **Preprocessing**: feature choice, log transforms, correlation pruning, clipping, scaling |
+# MAGIC | 4+ | Model selection, stability, interpretation (added in later steps) |
 # MAGIC
 # MAGIC Logic lives in `src/features/` and `src/segmentation/` (unit-tested); this notebook runs it
 # MAGIC and explains each decision.
@@ -362,5 +363,187 @@ for r in desc.collect():
     lines.append(
         f"| {r['feature']} | {r['n_null']} | {_fmt(r['min'])} | {_fmt(r['p50'])} | {_fmt(r['p95'])} | "
         f"{_fmt(r['p99'])} | {_fmt(r['max'])} | {_fmt(r['mean'])} | {_fmt(r['skewness'])} |"
+    )
+print("\n".join(lines))
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 3. Preprocessing
+# MAGIC
+# MAGIC Clustering groups customers by **distance**, so what goes into the distance matters more
+# MAGIC than which algorithm we pick. Four decisions, each a pure function in
+# MAGIC `src/segmentation/preprocessing.py`:
+# MAGIC
+# MAGIC | Step | Choice | Why (and the alternative) |
+# MAGIC |---|---|---|
+# MAGIC | Feature choice | 7 behavioural candidates in priority order, near-duplicates pruned | Fewer, independent, explainable dimensions. Alternative: PCA, which removes redundancy but makes segments hard to explain to the business |
+# MAGIC | Skew | `log1p` where raw skewness > 1 | Money/counts have long tails (monetary skew 25). Alternative: rank/quantile transform (RFM-score style): robust but throws away *how much* bigger |
+# MAGIC | Outliers | clip to [p1, p99] after the log, **keep** the customer | The top customers are real and valuable; removing them would leave them unsegmented. Alternative: drop/separate them, or a robust scaler |
+# MAGIC | Scale | standardise (mean 0, sd 1) | Equal weight per feature. Alternative: min-max (one outlier squeezes everyone else) |
+# MAGIC
+# MAGIC Kept in the feature table but **not** clustered on (used to *profile* segments in step 5):
+
+# COMMAND ----------
+
+from segmentation.plots import correlation_heatmap
+from segmentation.preprocessing import (
+    CANDIDATE_FEATURES,
+    CLIP_QUANTILES,
+    CORRELATION_THRESHOLD,
+    PROFILE_ONLY_FEATURES,
+    SKEW_THRESHOLD,
+    apply_preprocessor,
+    choose_log_features,
+    clip_counts,
+    correlation_matrix,
+    fit_preprocessor,
+    log_transform,
+    prune_correlated,
+    scaled_name,
+)
+
+for feature, reason in PROFILE_ONLY_FEATURES.items():
+    print(f"profile only  {feature:30s} {reason}")
+
+customers = spark.table(ML_CUSTOMER_FEATURES).where(snapshot_predicate(AS_OF))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.1 Log transform: which features?
+# MAGIC
+# MAGIC Rule: skewness > 1 on the raw scale. Recency (0.89), tenure (-0.62) and seasonal share
+# MAGIC (0.50) stay linear: their ranges are bounded (days in the data, a share in [0, 1]).
+
+# COMMAND ----------
+
+raw_skew = {
+    r["feature"]: r["skewness"] for r in describe_features(customers, CANDIDATE_FEATURES).collect()
+}
+LOG_CANDIDATES = choose_log_features(raw_skew, CANDIDATE_FEATURES, SKEW_THRESHOLD)
+print("log1p applied to:", LOG_CANDIDATES)
+
+logged = log_transform(customers.select("customer_id", *CANDIDATE_FEATURES), LOG_CANDIDATES)
+display(describe_features(logged, CANDIDATE_FEATURES))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.2 Correlation check and pruning
+# MAGIC
+# MAGIC Correlation is measured on the **transformed** scale (what the algorithm will see).
+# MAGIC Walking the candidates in priority order, a feature is dropped if |r| > 0.9 with one
+# MAGIC already kept. Two highly correlated features would count the same behaviour twice in the
+# MAGIC distance. `n_purchase_days` is in the list on purpose, as a near-copy of `frequency`.
+# MAGIC
+# MAGIC Pairwise correlation can't see *combinations*: `log(avg_basket) = log(monetary) -
+# MAGIC log(frequency)` is an exact identity, so basket value is excluded by design (above),
+# MAGIC not by this check.
+
+# COMMAND ----------
+
+corr = correlation_matrix(logged, CANDIDATE_FEATURES)
+CLUSTER_FEATURES, dropped = prune_correlated(CANDIDATE_FEATURES, corr, CORRELATION_THRESHOLD)
+LOG_FEATURES = [f for f in LOG_CANDIDATES if f in CLUSTER_FEATURES]
+print("clustering features:", CLUSTER_FEATURES)
+print("log features      :", LOG_FEATURES)
+print("dropped           :", {k: (v[0], round(v[1], 3)) for k, v in dropped.items()})
+corr_fig = correlation_heatmap(corr, CANDIDATE_FEATURES, "Correlation (log1p where skewed)")
+display(corr_fig)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.3 Fit clipping + scaling, apply, verify
+# MAGIC
+# MAGIC The fitted parameters (bounds, means, sds) are a small JSON dict. The same dict is logged
+# MAGIC to MLflow with every model run, and Phase 6 scoring re-applies it **without refitting**,
+# MAGIC so new customers are scaled exactly like the training customers.
+
+# COMMAND ----------
+
+pp = fit_preprocessor(customers, CLUSTER_FEATURES, LOG_FEATURES, CLIP_QUANTILES)
+clipped = clip_counts(customers, pp)
+for f in CLUSTER_FEATURES:
+    print(
+        f"{f:24s} log={f in LOG_FEATURES!s:5s} bounds=[{pp.lower[f]:.3f}, {pp.upper[f]:.3f}] "
+        f"mean={pp.mean[f]:.3f} sd={pp.std[f]:.3f} clipped low/high={clipped[f]}"
+    )
+
+prepared = apply_preprocessor(customers, pp, keep=["customer_id"])
+Z_COLS = [scaled_name(f) for f in CLUSTER_FEATURES]
+z_check = prepared.agg(
+    *[F.mean(c).alias(f"mean_{c}") for c in Z_COLS], *[F.stddev(c).alias(f"sd_{c}") for c in Z_COLS]
+).first()
+for c in Z_COLS:
+    assert abs(z_check[f"mean_{c}"]) < 1e-6 and abs(z_check[f"sd_{c}"] - 1) < 1e-6, c
+print("all scaled features have mean 0, sd 1")
+display(describe_features(prepared, Z_COLS))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.4 Log the preprocessing to MLflow, cache the prepared data
+# MAGIC
+# MAGIC `prepared` (5,852 rows) is reused by every model fit in sections 4-5, so it's cached
+# MAGIC (`df.cache()` works on serverless, to local disk, for this session; Phase 2 probe).
+
+# COMMAND ----------
+
+mlflow.set_experiment(EXPERIMENT_PATH)
+with mlflow.start_run(run_name="preprocessing") as pp_run:
+    mlflow.set_tags({"phase": "3", "kind": "preprocessing", "feature_table": ML_CUSTOMER_FEATURES})
+    mlflow.log_params(
+        {
+            "as_of_date": str(AS_OF),
+            "n_customers": checks["customers"],
+            "cluster_features": ",".join(CLUSTER_FEATURES),
+            "log_features": ",".join(LOG_FEATURES),
+            "skew_threshold": SKEW_THRESHOLD,
+            "correlation_threshold": CORRELATION_THRESHOLD,
+            "clip_quantiles": f"{CLIP_QUANTILES[0]},{CLIP_QUANTILES[1]}",
+            "dropped_correlated": ",".join(dropped) or "none",
+        }
+    )
+    mlflow.log_dict(pp.to_dict(), "preprocessing/params.json")
+    mlflow.log_dict(
+        {f"{a}|{b}": r for (a, b), r in corr.items() if a < b}, "preprocessing/correlation.json"
+    )
+    mlflow.log_dict({k: list(v) for k, v in clipped.items()}, "preprocessing/clip_counts.json")
+    mlflow.log_dict(PROFILE_ONLY_FEATURES, "preprocessing/profile_only_features.json")
+    mlflow.log_figure(corr_fig, "preprocessing/correlation_heatmap.png")
+PREPROCESS_RUN_ID = pp_run.info.run_id
+print("preprocessing run:", PREPROCESS_RUN_ID)
+
+prepared = prepared.cache()
+print("prepared rows:", prepared.count())
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.5 Summary to paste back into the chat
+
+# COMMAND ----------
+
+lines = ["### Phase 3.2 results", ""]
+lines.append(f"- raw skewness: { {k: round(v, 3) for k, v in raw_skew.items()} }")
+lines.append(f"- log features: {LOG_FEATURES}")
+lines.append(f"- clustering features: {CLUSTER_FEATURES}")
+lines.append(f"- dropped: { {k: (v[0], round(v[1], 3)) for k, v in dropped.items()} }")
+lines.append(f"- clipped (low, high): {clipped}")
+lines.append(f"- preprocessing run: {PREPROCESS_RUN_ID}")
+lines += [
+    "",
+    "| | " + " | ".join(CANDIDATE_FEATURES) + " |",
+    "|---" * (len(CANDIDATE_FEATURES) + 1) + "|",
+]
+for a in CANDIDATE_FEATURES:
+    lines.append(f"| {a} | " + " | ".join(f"{corr[(a, b)]:.3f}" for b in CANDIDATE_FEATURES) + " |")
+lines += ["", "| feature | lower | upper | mean | sd |", "|---|---|---|---|---|"]
+for f in CLUSTER_FEATURES:
+    lines.append(
+        f"| {f} | {pp.lower[f]:.4f} | {pp.upper[f]:.4f} | {pp.mean[f]:.4f} | {pp.std[f]:.4f} |"
     )
 print("\n".join(lines))
