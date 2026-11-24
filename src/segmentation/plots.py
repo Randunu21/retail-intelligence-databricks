@@ -85,3 +85,36 @@ def share_bars(shares_by_label: dict, title: str):
     ax.margins(y=0.15)
     fig.tight_layout()
     return fig
+
+
+def ari_bars(rows, threshold: float, title: str):
+    """Grouped bars: mean seed ARI and mean bootstrap ARI per (algorithm, k); whiskers to min."""
+    import matplotlib.pyplot as plt
+
+    rows = [r for r in rows if not r.get("error")]
+    labels = [f"{r['algorithm']}\nk={r['k']}" for r in rows]
+    x = list(range(len(rows)))
+    w = 0.38
+    fig, ax = plt.subplots(figsize=(max(6, 1.0 * len(rows) + 2), 4))
+    for offset, key, name in [(-w / 2, "seed", "seeds"), (w / 2, "bootstrap", "bootstrap")]:
+        means = [r[f"{key}_ari_mean"] for r in rows]
+        mins = [r[f"{key}_ari_min"] for r in rows]
+        err = [[m - lo for m, lo in zip(means, mins, strict=True)], [0] * len(rows)]
+        ax.bar(
+            [i + offset for i in x],
+            means,
+            w,
+            yerr=err,
+            capsize=3,
+            label=f"{name} (mean, whisker = min)",
+        )
+    ax.axhline(
+        threshold, color="black", linestyle="--", linewidth=1, label=f"threshold {threshold}"
+    )
+    ax.set_xticks(x, labels=labels, fontsize=8)
+    ax.set_ylim(min(0.0, ax.get_ylim()[0]), 1.05)
+    ax.set_ylabel("adjusted Rand index")
+    ax.set_title(title)
+    ax.legend(fontsize=8, loc="upper left", bbox_to_anchor=(1.01, 1.0))
+    fig.tight_layout()
+    return fig

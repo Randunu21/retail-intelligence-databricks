@@ -15,7 +15,8 @@
 # MAGIC | 2 | **Customer feature table** `retail.ml.customer_features` (feature table in Unity Catalog) |
 # MAGIC | 3 | **Preprocessing**: feature choice, log transforms, correlation pruning, clipping, scaling |
 # MAGIC | 4 | **Model selection**: KMeans / bisecting k-means / GMM for k = 2..10, every run in MLflow |
-# MAGIC | 5+ | Stability, interpretation, outputs (added in later steps) |
+# MAGIC | 5 | **Stability**: seeds + bootstrap samples compared with the adjusted Rand index; final model choice |
+# MAGIC | 6+ | Interpretation and outputs (added in the next step) |
 # MAGIC
 # MAGIC Logic lives in `src/features/` and `src/segmentation/` (unit-tested); this notebook runs it
 # MAGIC and explains each decision.
@@ -766,4 +767,171 @@ for a, k in suggested.items():
     if k is not None:
         t = next(r for r in sweep_results if r["algorithm"] == a and r["k"] == k)
         lines.append(f"- shares {a} k={k}: { {c: round(v, 4) for c, v in t['shares'].items()} }")
+print("\n".join(lines))
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5. Stability and the final choice
+# MAGIC
+# MAGIC Silhouette says the segments are *separated*; it doesn't say they're *reproducible*. If
+# MAGIC refitting moves hundreds of customers between segments, campaigns built on them would churn
+# MAGIC for no business reason. Two tests per candidate (`src/segmentation/stability.py`):
+# MAGIC
+# MAGIC - **Seeds**: 5 fits on the full data with different random seeds, ARI for all 10 pairs.
+# MAGIC - **Bootstrap**: 5 fits on bootstrap samples (5,852 customers drawn *with replacement*),
+# MAGIC   each used to label **all** customers, ARI against the reference fit (seed 42, full data).
+# MAGIC
+# MAGIC **Adjusted Rand index (ARI)**: agreement between two labelings of the same customers,
+# MAGIC ignoring cluster numbering, corrected for chance. 1 = identical, ~0 = random. Threshold
+# MAGIC here: mean >= 0.8 on both tests. Alternatives: Jaccard per segment (shows *which* segment is
+# MAGIC unstable), or normalised mutual information.
+# MAGIC
+# MAGIC **Candidates** (from section 4): KMeans k = 3..7 (best silhouette at every k; k = 3 and 4
+# MAGIC practically tied, elbow at 5, a second bump at 7), bisecting k = 3, 4, and GMM k = 3 for
+# MAGIC comparison (GMM's silhouette collapses beyond k = 3).
+# MAGIC
+# MAGIC **Final rule** (`choose_final`): stable (both mean ARIs >= 0.8) and smallest segment >= 3%;
+# MAGIC then the best silhouette; within 0.01 of it (a practical tie) prefer the **larger k**, since
+# MAGIC more segments allow more targeted actions at no real cost in separation. The tolerance is a
+# MAGIC judgement call, stated before seeing the stability numbers.
+
+# COMMAND ----------
+
+from segmentation.plots import ari_bars
+from segmentation.stability import choose_final, stability
+
+STABILITY_CANDIDATES = [("kmeans", k) for k in range(3, 8)] + [
+    ("bisecting_kmeans", 3),
+    ("bisecting_kmeans", 4),
+    ("gmm", 3),
+]
+STABILITY_SEEDS = (SEED, 1, 2, 3, 4)  # first = reference (same seed as the sweep)
+BOOTSTRAP_SEEDS = (101, 102, 103, 104, 105)
+MIN_ARI = 0.8
+SIL_TOLERANCE = 0.01
+
+# Same pattern as section 4: set RUN_STABILITY = False and paste the run id once recorded.
+RUN_STABILITY = True
+STABILITY_RUN_ID = None
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5.1 Run (one parent MLflow run `stability`, one nested run per candidate)
+# MAGIC
+# MAGIC 8 candidates x 10 fits = 80 fits; expect roughly 10-15 minutes on serverless.
+
+# COMMAND ----------
+
+if RUN_STABILITY:
+    mlflow.set_experiment(EXPERIMENT_PATH)
+    stability_results = []
+    with mlflow.start_run(run_name="stability") as stab_run:
+        mlflow.set_tags({"phase": "3", "kind": "stability", "sweep_run_id": SWEEP_RUN_ID})
+        mlflow.log_params(
+            {
+                **common_params,
+                "seeds": ",".join(map(str, STABILITY_SEEDS)),
+                "bootstrap_seeds": ",".join(map(str, BOOTSTRAP_SEEDS)),
+                "min_ari": MIN_ARI,
+            }
+        )
+        for algo, k in STABILITY_CANDIDATES:
+            res = stability(algo, prepared, k, Z_COLS, STABILITY_SEEDS, BOOTSTRAP_SEEDS)
+            d = res.to_dict()
+            stability_results.append(d)
+            with mlflow.start_run(run_name=f"stability_{algo}_k{k}", nested=True):
+                mlflow.set_tags(
+                    {
+                        "phase": "3",
+                        "kind": "stability_trial",
+                        "algorithm": algo,
+                        "status": "failed" if res.error else "ok",
+                    }
+                )
+                mlflow.log_params({"algorithm": algo, "k": k})
+                mlflow.log_metrics({m: v for m, v in res.summary().items() if v is not None})
+                mlflow.log_dict(d, "stability/result.json")
+            print(f"{algo:17s} k={k} {res.summary()} error={res.error}")
+        mlflow.log_dict({"results": stability_results}, "stability/results.json")
+    STABILITY_RUN_ID = stab_run.info.run_id
+else:
+    stability_results = mlflow.artifacts.load_dict(
+        f"runs:/{STABILITY_RUN_ID}/stability/results.json"
+    )["results"]
+print("stability run:", STABILITY_RUN_ID)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5.2 Compare and choose
+
+# COMMAND ----------
+
+stab_table = pd.DataFrame(
+    [
+        {
+            "algorithm": r["algorithm"],
+            "k": r["k"],
+            "silhouette": next(
+                x["silhouette"]
+                for x in rows
+                if (x["algorithm"], x["k"]) == (r["algorithm"], r["k"])
+            ),
+            **{
+                m: r[m]
+                for m in [
+                    "seed_ari_mean",
+                    "seed_ari_min",
+                    "bootstrap_ari_mean",
+                    "bootstrap_ari_min",
+                ]
+            },
+            "error": r["error"],
+        }
+        for r in stability_results
+    ]
+)
+display(stab_table)
+
+fig_ari = ari_bars(
+    stability_results, MIN_ARI, "Stability: adjusted Rand index (seeds vs bootstrap)"
+)
+display(fig_ari)
+
+FINAL = choose_final(rows, stability_results, MIN_SHARE, MIN_ARI, SIL_TOLERANCE)
+print("final choice:", FINAL)
+assert FINAL is not None, "no candidate passed: revisit thresholds/features before naming segments"
+
+with mlflow.start_run(run_id=STABILITY_RUN_ID):
+    mlflow.log_figure(fig_ari, "stability/ari_by_candidate.png")
+    mlflow.log_text(stab_table.to_csv(index=False), "stability/results_table.csv")
+    mlflow.log_dict(FINAL, "stability/final_choice.json")
+    mlflow.set_tags({"final_algorithm": FINAL["algorithm"], "final_k": str(FINAL["k"])})
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5.3 Summary to paste back into the chat
+
+# COMMAND ----------
+
+scols = ["silhouette", "seed_ari_mean", "seed_ari_min", "bootstrap_ari_mean", "bootstrap_ari_min"]
+lines = [
+    "### Phase 3.4 results",
+    "",
+    f"- stability run: {STABILITY_RUN_ID}",
+    f"- final choice: {FINAL}",
+    "",
+    "| algorithm | k | " + " | ".join(scols) + " | error |",
+    "|---|---|" + "---|" * (len(scols) + 1),
+]
+for r in stab_table.to_dict("records"):
+    lines.append(
+        f"| {r['algorithm']} | {r['k']} | "
+        + " | ".join("" if r[c] is None else f"{r[c]:.4f}" for c in scols)
+        + f" | {r['error'] or ''} |"
+    )
 print("\n".join(lines))
