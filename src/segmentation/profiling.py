@@ -88,6 +88,53 @@ def order_centers(
     }
 
 
+def segment_model_from_centers(
+    centers: Sequence[Sequence[float]],
+    params: PreprocessParams,
+    seed: int,
+    order_by: str = "monetary",
+) -> SegmentModel:
+    """Build the SegmentModel from KMeans centres (any order), re-ordered by value."""
+    ordered, _ = order_centers(centers, params.features, order_by)
+    return SegmentModel(
+        algorithm="kmeans",
+        k=len(ordered),
+        seed=seed,
+        features=list(params.features),
+        centers=ordered,
+        preprocess=params.to_dict(),
+        order_by=order_by,
+    )
+
+
+def segment_model_from_trial(
+    sweep_results: Sequence[Mapping],
+    k: int,
+    params: PreprocessParams,
+    seed: int,
+    order_by: str = "monetary",
+) -> SegmentModel:
+    """The final model = the centres RECORDED by the KMeans sweep trial for this k.
+
+    Why not refit: on serverless, refitting KMeans with the same seed is not bit-reproducible
+    across sessions (the k-means|| initialisation depends on how the input is partitioned), so
+    a refit can differ from the model that was evaluated in the sweep and stability checks.
+    Using the recorded centres guarantees the final model IS the evaluated one; the notebook
+    then verifies it reproduces the trial's silhouette. (Bug found and fixed in Phase 3.5a.)
+    """
+    trial = next(
+        (
+            r
+            for r in sweep_results
+            if r["algorithm"] == "kmeans" and r["k"] == k and not r.get("error")
+        ),
+        None,
+    )
+    if trial is None:
+        raise ValueError(f"no successful KMeans trial with k={k} in the sweep results")
+    return segment_model_from_centers(trial["model_info"]["centers"], params, seed, order_by)
+
+
 def fit_segment_model(
     prepared: DataFrame,
     params: PreprocessParams,
@@ -96,22 +143,17 @@ def fit_segment_model(
     features_col: str = "features",
     order_by: str = "monetary",
 ) -> SegmentModel:
-    """Fit KMeans on the preprocessed customers and return a model-free SegmentModel."""
+    """Fit KMeans on the preprocessed customers and return a model-free SegmentModel.
+
+    For a fresh model (e.g. a new snapshot). Note: not bit-reproducible across serverless
+    sessions; to reuse an evaluated model, use `segment_model_from_trial`.
+    """
     from pyspark.ml.clustering import KMeans
 
     model = KMeans(k=k, seed=seed, maxIter=100, featuresCol=features_col).fit(prepared)
     centers = [[float(x) for x in c] for c in model.clusterCenters()]
     del model  # free the serverless model cache; the centres are all we need
-    ordered, _ = order_centers(centers, params.features, order_by)
-    return SegmentModel(
-        algorithm="kmeans",
-        k=k,
-        seed=seed,
-        features=list(params.features),
-        centers=ordered,
-        preprocess=params.to_dict(),
-        order_by=order_by,
-    )
+    return segment_model_from_centers(centers, params, seed, order_by)
 
 
 # Profile columns: numeric features summarised by mean and median per segment.

@@ -16,8 +16,8 @@
 # MAGIC | 3 | **Preprocessing**: feature choice, log transforms, correlation pruning, clipping, scaling |
 # MAGIC | 4 | **Model selection**: KMeans / bisecting k-means / GMM for k = 2..10, every run in MLflow |
 # MAGIC | 5 | **Stability**: seeds + bootstrap samples compared with the adjusted Rand index; final model choice |
-# MAGIC | 6 | **Final model and profiles**: refit the chosen model, stable segment ids, profile per segment |
-# MAGIC | 7+ | Names, actions, `gold.customer_segments`, docs (added in the next step) |
+# MAGIC | 6 | **Final model and profiles**: the evaluated sweep model (recorded centres), stable segment ids, profile per segment |
+# MAGIC | 7 | **Names, action groups, outputs**: `retail.gold.customer_segments` + generated `docs/segment_profiles.md` |
 # MAGIC
 # MAGIC Logic lives in `src/features/` and `src/segmentation/` (unit-tested); this notebook runs it
 # MAGIC and explains each decision.
@@ -960,6 +960,13 @@ print("\n".join(lines))
 # MAGIC BisectingKMeans). **Segment ids are ordered by value**: segment 0 has the highest
 # MAGIC monetary centre. KMeans' own numbering is arbitrary and can swap between refits; names
 # MAGIC are attached by profile in section 7, never by raw cluster number.
+# MAGIC
+# MAGIC **The final model is the recorded sweep trial, not a refit.** On serverless, refitting
+# MAGIC KMeans with the same seed is *not* bit-reproducible across sessions: the k-means||
+# MAGIC initialisation depends on how the input is partitioned. A refit could differ from the model
+# MAGIC that the sweep and stability checks evaluated, so the centres are taken from the sweep's
+# MAGIC results (`segment_model_from_trial`) and 6.1 proves they reproduce that trial. (Found
+# MAGIC while running 3.5a; also why the model is stored as JSON centres in MLflow.)
 
 # COMMAND ----------
 
@@ -970,23 +977,23 @@ from segmentation.plots import centroid_heatmap
 from segmentation.profiling import (
     PROFILE_FEATURES,
     SEGMENT_COL,
-    fit_segment_model,
     overall_profile,
+    segment_model_from_trial,
     segment_profile,
 )
 from segmentation.stability import adjusted_rand_index
 
 assert FINAL["algorithm"] == "kmeans", (
-    "fit_segment_model refits KMeans; extend it for other algorithms"
+    "segment_model_from_trial rebuilds KMeans centres; extend it for other algorithms"
 )
 FINAL_K = FINAL["k"]
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 6.1 Refit and check it reproduces the sweep
+# MAGIC ### 6.1 Recover the evaluated model and check it reproduces the sweep trial
 # MAGIC
-# MAGIC Same data, features, k and seed as the sweep trial, so the silhouette must match it.
+# MAGIC Same data, features and centres as the sweep trial, so the silhouette must match it.
 
 # COMMAND ----------
 
@@ -994,19 +1001,7 @@ FINAL_K = FINAL["k"]
 # Refitting KMeans is not bit-reproducible across sessions on this compute (the k-means||
 # start depends on the input's partitioning), so take the final model's centres from the
 # recorded sweep trial instead of refitting, and check it reproduces that trial.
-from segmentation.profiling import SegmentModel, order_centers
-
-trial = next(r for r in sweep_results if r["algorithm"] == FINAL["algorithm"] and r["k"] == FINAL_K)
-ordered, _ = order_centers(trial["model_info"]["centers"], pp.features, "monetary")
-seg_model = SegmentModel(
-    algorithm="kmeans",
-    k=FINAL_K,
-    seed=SEED,
-    features=list(pp.features),
-    centers=ordered,
-    preprocess=pp.to_dict(),
-    order_by="monetary",
-)
+seg_model = segment_model_from_trial(sweep_results, FINAL_K, pp, SEED)
 assigned = seg_model.assign_prepared(prepared)  # z columns + features vector + segment_id
 model_silhouette = silhouette(assigned, "features", SEGMENT_COL)
 print(f"recovered silhouette {model_silhouette:.6f} vs sweep {FINAL['silhouette']:.6f}")
@@ -1151,6 +1146,7 @@ print("final model run:", FINAL_RUN_ID)
 
 # DBTITLE 1,6.5 Summary to paste back into the chat
 
+
 def _v(x, nd=3):
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return ""
@@ -1202,5 +1198,233 @@ for r in index_rows:
         f"| {r['feature']} | {_v(r['all_customers_median'])} | "
         + " | ".join(_v(r.get(f"seg{s}_index")) for s in segs)
         + " |"
+    )
+print("\n".join(lines))
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 7. Names, action groups and outputs
+# MAGIC
+# MAGIC ### 7.1 Names from the profiles
+# MAGIC
+# MAGIC Names come from the 3.5a profiles (see the docstring of `src/segmentation/naming.py`):
+# MAGIC
+# MAGIC | Signature (highest centre on) | Name | Why |
+# MAGIC |---|---|---|
+# MAGIC | monetary | **Loyal Customers** | 39% of customers, 86% of revenue; median 37 days since last order, 8 orders, 654 days tenure; nobody bought only once |
+# MAGIC | seasonal share | **Seasonal & New** | median Q4 share 1.0; 35% first bought in the last 90 days |
+# MAGIC | recency | **Hibernating** | median 396 days since last order; half bought once; 7.5% active in 90 days |
+# MAGIC
+# MAGIC Names are attached by **signature, not cluster number**, and `name_segments` fails if a
+# MAGIC refit makes two signatures point at the same segment. That's a deliberate stop: names
+# MAGIC must be reviewed, never silently reused on changed profiles. "Champions", "At Risk" and
+# MAGIC "New" are not separate clusters here (k = 4 was unstable), so they appear as action groups.
+
+# COMMAND ----------
+
+from common.tables import GOLD_CUSTOMER_SEGMENTS
+from segmentation.naming import (
+    ACTION_PLAYBOOK,
+    TOP_VALUE_QUANTILE,
+    add_action_groups,
+    name_segments,
+    top_value_threshold,
+)
+from segmentation.outputs import (
+    build_segments_output,
+    render_segment_profiles_md,
+    segments_table_ddl,
+    write_segments,
+)
+from segmentation.plots import group_share_bars
+
+names = name_segments(seg_model.centers, seg_model.features)
+for sid in sorted(names):
+    print(sid, names[sid].key, "->", names[sid].name)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 7.2 Action groups
+# MAGIC
+# MAGIC Transparent rules inside each segment (alternatives: more clusters, which were unstable,
+# MAGIC or a classic RFM score grid, which ignores the structure the clustering found):
+# MAGIC
+# MAGIC - **overdue**: repeat buyer whose days since the last order > 2 x their own average gap;
+# MAGIC   personal, so a monthly buyer is overdue after ~2 months, a twice-yearly buyer after ~a year.
+# MAGIC - **new**: first order in the last 90 days.
+# MAGIC - **top value**: spend in the top 10% of all customers.
+# MAGIC
+# MAGIC Loyal: At Risk (overdue) > Champions (top value) > Active. Seasonal & New: New Customers >
+# MAGIC Seasonal Gifters. Hibernating: Former Repeat Buyers (2+ orders) > One-time Buyers.
+
+# COMMAND ----------
+
+TOP_VALUE_MIN = top_value_threshold(customers, TOP_VALUE_QUANTILE)
+print(f"top-value threshold (p{int(TOP_VALUE_QUANTILE * 100)} of monetary): {TOP_VALUE_MIN:,.2f}")
+grouped = add_action_groups(segmented, names, TOP_VALUE_MIN)
+assert grouped.where("action_group IS NULL").count() == 0, "a customer has no action group"
+
+group_pd = segment_profile(grouped, segment_col="action_group").toPandas()
+group_pd["order"] = group_pd["action_group"].map(list(ACTION_PLAYBOOK).index)
+group_pd = group_pd.sort_values("order").drop(columns="order")
+display(
+    group_pd[
+        [
+            "action_group",
+            "customers",
+            "customer_share",
+            "revenue_share",
+            "median_recency_days",
+            "median_frequency",
+            "median_monetary",
+            "median_tenure_days",
+            "median_seasonal_revenue_share",
+            "pct_bought_last_90d",
+        ]
+    ]
+)
+fig_groups = group_share_bars(
+    group_pd.to_dict("records"), "Action groups: share of customers vs revenue"
+)
+display(fig_groups)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 7.3 Write `retail.gold.customer_segments`
+# MAGIC
+# MAGIC One row per (customer_id, as_of_date) with segment, action group, recommended action, key
+# MAGIC features and lineage (`model_run_id` = the MLflow run of the final model). PK is
+# MAGIC informational (checked below); a re-run replaces only this snapshot.
+
+# COMMAND ----------
+
+ddl_segments = segments_table_ddl(GOLD_CUSTOMER_SEGMENTS)
+print(ddl_segments)
+spark.sql(ddl_segments)
+write_segments(build_segments_output(grouped, FINAL_RUN_ID), GOLD_CUSTOMER_SEGMENTS, AS_OF)
+
+gold_snap = spark.table(GOLD_CUSTOMER_SEGMENTS).where(f"as_of_date = DATE'{AS_OF}'")
+gold_check = gold_snap.agg(
+    F.count(F.lit(1)).alias("rows"),
+    F.countDistinct("customer_id").alias("customers"),
+    F.sum(F.col("segment_name").isNull().cast("int")).alias("null_names"),
+    F.countDistinct("model_run_id").alias("run_ids"),
+).first()
+print(gold_check)
+assert gold_check["rows"] == gold_check["customers"] == checks["customers"]
+assert gold_check["null_names"] == 0 and gold_check["run_ids"] == 1
+by_segment = {
+    r["segment_id"]: r["n"]
+    for r in gold_snap.groupBy("segment_id").agg(F.count(F.lit(1)).alias("n")).collect()
+}
+assert by_segment == {int(r[SEGMENT_COL]): int(r["customers"]) for _, r in profile_pd.iterrows()}
+display(
+    gold_snap.groupBy("segment_name", "action_group")
+    .count()
+    .orderBy("segment_name", "action_group")
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 7.4 Generate `docs/segment_profiles.md` (+ charts) and log to MLflow
+# MAGIC
+# MAGIC The document is generated from this run's numbers (no hand-typed results). It's written
+# MAGIC into the Git folder (`docs/` and `docs/img/phase3/`): commit it from the Databricks Git
+# MAGIC dialog, or pull and commit locally. If writing workspace files fails, the markdown is
+# MAGIC printed and logged to MLflow instead.
+
+# COMMAND ----------
+
+IMG_DIR = REPO_DIR / "docs" / "img" / "phase3"
+images = {
+    "Segment centres": "img/phase3/centroid_heatmap.png",
+    "Share of customers": "img/phase3/segment_sizes.png",
+    "Share of revenue": "img/phase3/revenue_share.png",
+    "Action groups": "img/phase3/action_groups.png",
+    "Silhouette by k": "img/phase3/silhouette_by_k.png",
+    "Elbow (WCSS) by k": "img/phase3/elbow_wcss_by_k.png",
+    "Stability (ARI)": "img/phase3/stability_ari.png",
+}
+figures = {
+    "Segment centres": fig_centres,
+    "Share of customers": fig_sizes,
+    "Share of revenue": fig_revenue,
+    "Action groups": fig_groups,
+    "Silhouette by k": fig_sil,
+    "Elbow (WCSS) by k": fig_wcss,
+    "Stability (ARI)": fig_ari,
+}
+model_facts = {
+    "Features": f"{checks['customers']:,} customers, snapshot {AS_OF}; clustered on "
+    + ", ".join(CLUSTER_FEATURES)
+    + f" (log1p: {', '.join(LOG_FEATURES)}; clipped to p1-p99; standardised)",
+    "Algorithm": f"KMeans, k = {FINAL_K}, seed {SEED} (compared with bisecting k-means and Gaussian mixture, k = 2-10)",
+    "Why k = 3": f"best silhouette ({FINAL['silhouette']:.3f}); k = 4 tied on silhouette but was unstable",
+    "Stability": f"mean ARI across seeds {FINAL['seed_ari_mean']:.3f}, across bootstrap samples {FINAL['bootstrap_ari_mean']:.3f}; "
+    f"agreement with bisecting k-means (k = 3) ARI {ARI_VS_BISECTING:.3f}",
+    "MLflow runs": f"preprocessing `{PREPROCESS_RUN_ID}`, sweep `{SWEEP_RUN_ID}`, stability `{STABILITY_RUN_ID}`, final model `{FINAL_RUN_ID}`",
+    "Output table": f"`{GOLD_CUSTOMER_SEGMENTS}`",
+}
+md = render_segment_profiles_md(
+    as_of=AS_OF,
+    n_customers=checks["customers"],
+    names=names,
+    segment_profiles=[
+        {**r, "segment_id": int(r[SEGMENT_COL])} for r in profile_pd.to_dict("records")
+    ],
+    group_profiles=group_pd.to_dict("records"),
+    model_facts=model_facts,
+    images=images,
+)
+
+try:
+    IMG_DIR.mkdir(parents=True, exist_ok=True)
+    for title, rel in images.items():
+        figures[title].savefig(REPO_DIR / "docs" / rel, dpi=120, bbox_inches="tight")
+    (REPO_DIR / "docs" / "segment_profiles.md").write_text(md)
+    print("written:", REPO_DIR / "docs" / "segment_profiles.md", "and", len(images), "charts")
+except Exception as e:
+    print(f"could not write to the Git folder ({type(e).__name__}: {e}); markdown below + MLflow")
+    print(md)
+
+with mlflow.start_run(run_id=FINAL_RUN_ID):
+    mlflow.log_dict(
+        {sid: {"key": d.key, "name": d.name} for sid, d in names.items()},
+        "naming/segment_names.json",
+    )
+    mlflow.log_dict(ACTION_PLAYBOOK, "naming/action_playbook.json")
+    mlflow.log_text(group_pd.to_csv(index=False), "profiles/action_group_profile.csv")
+    mlflow.log_figure(fig_groups, "profiles/action_groups.png")
+    mlflow.log_text(md, "docs/segment_profiles.md")
+    mlflow.log_param("top_value_min", round(TOP_VALUE_MIN, 2))
+    mlflow.set_tag("output_table", GOLD_CUSTOMER_SEGMENTS)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 7.5 Summary to paste back into the chat
+
+# COMMAND ----------
+
+lines = [
+    "### Phase 3.5b results",
+    "",
+    f"- names: { {sid: d.name for sid, d in sorted(names.items())} }",
+    f"- top-value threshold: {TOP_VALUE_MIN:,.2f}",
+    f"- gold check: {gold_check.asDict()}",
+    "",
+    "| action_group | customers | customer_share | revenue_share | median_recency | median_frequency | median_monetary | median_tenure | pct_bought_last_90d |",
+    "|---|---|---|---|---|---|---|---|---|",
+]
+for r in group_pd.to_dict("records"):
+    lines.append(
+        f"| {r['action_group']} | {r['customers']} | {r['customer_share']:.4f} | {r['revenue_share']:.4f} | "
+        f"{r['median_recency_days']} | {r['median_frequency']} | {r['median_monetary']:.2f} | "
+        f"{r['median_tenure_days']} | {r['pct_bought_last_90d']:.4f} |"
     )
 print("\n".join(lines))

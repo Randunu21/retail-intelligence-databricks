@@ -13,6 +13,8 @@ from segmentation.profiling import (
     fit_segment_model,
     order_centers,
     overall_profile,
+    segment_model_from_centers,
+    segment_model_from_trial,
     segment_profile,
 )
 
@@ -118,3 +120,38 @@ def test_overall_profile(customers):
     o = overall_profile(customers, ["frequency"])
     assert o["mean_frequency"] == pytest.approx(customers.selectExpr("avg(frequency)").first()[0])
     assert set(o) == {"mean_frequency", "median_frequency"}
+
+
+def test_segment_model_from_centers_orders_by_value(customers):
+    params = fit_preprocessor(customers, FEATURES, FEATURES)
+    m = segment_model_from_centers([[-1.0, 0.0], [2.0, 1.0], [0.5, -1.0]], params, seed=7)
+    assert m.centers == [[2.0, 1.0], [0.5, -1.0], [-1.0, 0.0]]
+    assert (m.k, m.seed, m.features) == (3, 7, FEATURES)
+    assert m.preprocess == params.to_dict()
+
+
+def test_segment_model_from_trial_uses_recorded_centres(customers):
+    params = fit_preprocessor(customers, FEATURES, FEATURES)
+    sweep = [
+        {"algorithm": "gmm", "k": 2, "error": None, "model_info": {"means": [[0, 0], [1, 1]]}},
+        {"algorithm": "kmeans", "k": 2, "error": "boom", "model_info": {}},
+        {
+            "algorithm": "kmeans",
+            "k": 3,
+            "error": None,
+            "model_info": {"centers": [[0.0, 0.0], [3.0, 3.0], [1.0, 1.0]]},
+        },
+    ]
+    m = segment_model_from_trial(sweep, 3, params, seed=42)
+    assert m.centers == [[3.0, 3.0], [1.0, 1.0], [0.0, 0.0]]
+    with pytest.raises(ValueError, match="k=2"):
+        segment_model_from_trial(sweep, 2, params, seed=42)  # only a failed KMeans trial
+
+
+def test_recovered_model_reproduces_the_fitted_assignment(model, customers):
+    """Rebuilding from the recorded centres gives the same segments as the fitted model."""
+    params = fit_preprocessor(customers, FEATURES, FEATURES, clip_quantiles=(0.0, 1.0))
+    again = segment_model_from_centers(list(reversed(model.centers)), params, seed=model.seed)
+    a = {r["customer_id"]: r[SEGMENT_COL] for r in model.score(customers).collect()}
+    b = {r["customer_id"]: r[SEGMENT_COL] for r in again.score(customers).collect()}
+    assert a == b
