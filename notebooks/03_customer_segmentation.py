@@ -990,12 +990,28 @@ FINAL_K = FINAL["k"]
 
 # COMMAND ----------
 
-seg_model = fit_segment_model(prepared, pp, FINAL_K, SEED)
+# DBTITLE 1,6.1 Recover the sweep trial and verify it
+# Refitting KMeans is not bit-reproducible across sessions on this compute (the k-means||
+# start depends on the input's partitioning), so take the final model's centres from the
+# recorded sweep trial instead of refitting, and check it reproduces that trial.
+from segmentation.profiling import SegmentModel, order_centers
+
+trial = next(r for r in sweep_results if r["algorithm"] == FINAL["algorithm"] and r["k"] == FINAL_K)
+ordered, _ = order_centers(trial["model_info"]["centers"], pp.features, "monetary")
+seg_model = SegmentModel(
+    algorithm="kmeans",
+    k=FINAL_K,
+    seed=SEED,
+    features=list(pp.features),
+    centers=ordered,
+    preprocess=pp.to_dict(),
+    order_by="monetary",
+)
 assigned = seg_model.assign_prepared(prepared)  # z columns + features vector + segment_id
-refit_silhouette = silhouette(assigned, "features", SEGMENT_COL)
-print(f"refit silhouette {refit_silhouette:.6f} vs sweep {FINAL['silhouette']:.6f}")
-assert abs(refit_silhouette - FINAL["silhouette"]) < 1e-6, (
-    "refit does not reproduce the sweep trial"
+model_silhouette = silhouette(assigned, "features", SEGMENT_COL)
+print(f"recovered silhouette {model_silhouette:.6f} vs sweep {FINAL['silhouette']:.6f}")
+assert abs(model_silhouette - FINAL["silhouette"]) < 1e-6, (
+    "recovered model does not reproduce the sweep trial"
 )
 
 segmented = customers.join(assigned.select("customer_id", SEGMENT_COL), "customer_id")
@@ -1084,6 +1100,7 @@ display(fig_revenue)
 
 # COMMAND ----------
 
+# DBTITLE 1,6.4 Log the final model to MLflow
 sweep_row = next(r for r in rows if (r["algorithm"], r["k"]) == ("kmeans", FINAL_K))
 mlflow.set_experiment(EXPERIMENT_PATH)
 with mlflow.start_run(run_name=f"final_kmeans_k{FINAL_K}") as final_run:
@@ -1107,7 +1124,7 @@ with mlflow.start_run(run_name=f"final_kmeans_k{FINAL_K}") as final_run:
     )
     mlflow.log_metrics(
         {
-            "silhouette": refit_silhouette,
+            "silhouette": model_silhouette,
             "wcss": sweep_row["wcss"],
             "min_share": sweep_row["min_share"],
             "seed_ari_mean": FINAL["seed_ari_mean"],
@@ -1132,6 +1149,7 @@ print("final model run:", FINAL_RUN_ID)
 
 # COMMAND ----------
 
+# DBTITLE 1,6.5 Summary to paste back into the chat
 
 def _v(x, nd=3):
     if x is None or (isinstance(x, float) and pd.isna(x)):
@@ -1144,7 +1162,7 @@ lines = [
     "### Phase 3.5a results",
     "",
     f"- final model run: {FINAL_RUN_ID}",
-    f"- refit silhouette: {refit_silhouette:.4f}",
+    f"- final model silhouette: {model_silhouette:.4f}",
     f"- ARI vs bisecting k={FINAL_K}: {ARI_VS_BISECTING:.4f}",
     f"- crosstab (rows = segment_id, cols = bisecting cluster): {[tuple(r) for r in crosstab.collect()]}",
     "- centres (z): "
