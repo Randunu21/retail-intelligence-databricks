@@ -6,8 +6,11 @@ from collections.abc import Sequence
 from importlib.metadata import PackageNotFoundError, version
 
 # pip distribution name -> what the probe calls it
+# Serverless installs MLflow as the `mlflow-skinny` distribution (the `mlflow` module is the
+# same), so both names are probed; `mlflow` alone showed None in the 5.1 probe.
 PROBE_PACKAGES: tuple[str, ...] = (
     "mlflow",
+    "mlflow-skinny",
     "scikit-learn",
     "lightgbm",
     "optuna",

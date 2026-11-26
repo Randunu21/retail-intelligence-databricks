@@ -123,8 +123,8 @@ print("experiment:", EXPERIMENT_PATH)
 
 # COMMAND ----------
 
-RUN_PROBE = True
-PROBE_RUN_ID = None  # e.g. "abc123..." after the first run
+RUN_PROBE = False
+PROBE_RUN_ID = "7748bb7d8e3e4b088f0129bca7d91528"  # recorded 2026-11-26
 
 # COMMAND ----------
 
@@ -342,7 +342,7 @@ print(" ", ", ".join(MODEL_FEATURES))
 
 # COMMAND ----------
 
-RUN_LEAKAGE_CHECK = True
+RUN_LEAKAGE_CHECK = False  # recorded in the training_set run (all 0 differences)
 
 if RUN_LEAKAGE_CHECK:
     leakage_checks = [
@@ -373,7 +373,7 @@ if RUN_LEAKAGE_CHECK:
 
 # COMMAND ----------
 
-RUN_BUILD_TRAINING_SET = True
+RUN_BUILD_TRAINING_SET = False  # table built 2026-11-26 (53,440 rows)
 
 if RUN_BUILD_TRAINING_SET:
     build_times = {}
@@ -443,7 +443,7 @@ display(by_split.reset_index())
 
 # COMMAND ----------
 
-RUN_FE_PIT_CHECK = True
+RUN_FE_PIT_CHECK = False  # recorded: 53,440 = 53,440, 0 differences
 PIT_COLUMNS = ["recency_days", "frequency", "monetary", "tenure_days", "return_rate", "seasonal_revenue_share"]
 
 if RUN_FE_PIT_CHECK:
@@ -488,8 +488,8 @@ if RUN_FE_PIT_CHECK:
 
 # COMMAND ----------
 
-RUN_LOG_TRAINING_SET = True
-TRAINING_SET_RUN_ID = None  # paste after the first run
+RUN_LOG_TRAINING_SET = False
+TRAINING_SET_RUN_ID = "84a37971498d4e5487cb6535665c852a"  # recorded 2026-11-26
 
 if RUN_LOG_TRAINING_SET:
     mlflow.set_experiment(EXPERIMENT_PATH)
@@ -539,4 +539,228 @@ lines += [
 ]
 lines += ["", "| split | rows | positives | rate |", "|---|---:|---:|---:|"]
 lines += [f"| {r['split']} | {r['rows']:,} | {r['positives']:,} | {r['positive_rate']} |" for r in ts_summary["by_split"]]
+print("\n".join(lines))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 3. Evaluation helpers and the logistic regression baseline (step 5.2)
+# MAGIC
+# MAGIC ### 3.0 What "good" means here *(interview point)*
+# MAGIC
+# MAGIC The model's job is to **rank** customers for a campaign with a limited budget ("contact
+# MAGIC the 20 % most likely to come back"), and sometimes to give **probabilities** (expected
+# MAGIC revenue = p × basket value). So:
+# MAGIC
+# MAGIC | Metric | Reads as | Why it's here |
+# MAGIC |---|---|---|
+# MAGIC | **PR-AUC** (average precision) | precision averaged over all recall levels; no-skill = base rate | **primary metric**: focuses on the buyers a campaign acts on; read next to the base rate (`pr_auc_lift`) |
+# MAGIC | ROC-AUC | chance a random buyer is scored above a random non-buyer | threshold-free ranking quality; stable, but blind to *where* in the list the errors are |
+# MAGIC | capture top 10/20/30 % | share of all repeat buyers in the top x % by score | the business sentence: "top 20 % captures X % of repeat buyers" |
+# MAGIC | Brier, ECE, reliability curve | are scores honest probabilities? | needed before p is multiplied by money |
+# MAGIC
+# MAGIC **Accuracy is not reported**: at a 32 % base rate, "nobody comes back" is already 68 %
+# MAGIC accurate, and accuracy depends on a 0.5 threshold nobody uses.
+# MAGIC
+# MAGIC **Class imbalance: no reweighting.** Positives are 45 % of training rows and 32–44 % in
+# MAGIC validation / test: not rare. Reweighting (`class_weight="balanced"`, `scale_pos_weight`)
+# MAGIC barely changes the *ranking* but shifts every probability upwards, which breaks
+# MAGIC calibration. With rare positives (say < 5 %) we'd revisit: weights or undersampling
+# MAGIC for training, then recalibrate.
+# MAGIC
+# MAGIC **Model selection uses validation only; the test cutoff (2011-09-11) is not loaded until
+# MAGIC step 5.4**, so the final numbers are an honest estimate on data no decision has seen.
+
+# COMMAND ----------
+
+from modeling.baseline import (
+    DEFAULT_C_GRID,
+    LOG_FEATURES,
+    best_by,
+    coefficients,
+    fit_logistic_grid,
+    positive_proba,
+    recency_rule_scores,
+)
+from modeling.dataset import feature_health, split_frames, to_pandas
+from modeling.evaluation import (
+    evaluate,
+    plot_bars,
+    plot_calibration,
+    plot_gain,
+    plot_lift,
+    plot_roc_pr,
+    prefixed,
+)
+
+print("mlflow module version:", mlflow.__version__)
+
+pdf = to_pandas(training_set, splits=("train", "validation"))  # test stays unloaded until 5.4
+SPLITS = split_frames(pdf)
+train, val = SPLITS["train"], SPLITS["validation"]
+print(f"train {train.n:,} rows ({train.y.mean():.4f} positive), validation {val.n:,} ({val.y.mean():.4f})")
+
+health = feature_health(train.X)
+assert health.loc[list(LOG_FEATURES), "n_negative"].sum() == 0, "log1p needs non-negative inputs"
+display(health.reset_index(names="feature"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.1 Rule baseline: "most recent buyers first"
+# MAGIC
+# MAGIC Before any model: what does the obvious marketing rule achieve? Score = 1 / (1 + recency
+# MAGIC days). It's not a probability (so no calibration), only a ranking. Every model has to
+# MAGIC beat this to be worth running.
+
+# COMMAND ----------
+
+rule_val = evaluate(val.y, recency_rule_scores(val.X))
+print({k: round(v, 4) for k, v in rule_val["metrics"].items() if k not in ("n", "positives")})
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.2 Logistic regression
+# MAGIC
+# MAGIC Pipeline (`modeling.baseline.make_logistic_pipeline`, pure scikit-learn so the saved
+# MAGIC model needs none of our code to load):
+# MAGIC
+# MAGIC 1. median imputation (only `mean_days_between_purchases` has NULLs: one-day customers),
+# MAGIC    plus a **missing indicator** for it, so "no second purchase day yet" stays visible;
+# MAGIC 2. `log1p` on skewed counts and money (Phase 3: monetary skew 25) so a linear model sees
+# MAGIC    "10× more spend" as a constant step, not a huge outlier;
+# MAGIC 3. standardise; 4. L2-regularised logistic regression.
+# MAGIC
+# MAGIC Regularisation strength `C` from a small grid (0.01, 0.1, 1, 10), chosen on **validation
+# MAGIC PR-AUC** (ties → smaller C). One parent MLflow run, one nested run per C; the chosen
+# MAGIC model is logged with a **signature** (input columns and types, output shape) and an
+# MAGIC **input example**, both required by the Unity Catalog registry in step 5.5.
+# MAGIC `pyfunc_predict_fn="predict_proba"` makes the generic MLflow loader return
+# MAGIC probabilities (column 1 = P(repeat)) rather than 0/1 classes.
+# MAGIC
+# MAGIC Why logistic regression as the baseline: fast, well understood, calibrated by
+# MAGIC construction (it minimises log loss), and its coefficients are explainable. Its
+# MAGIC limitation is the point of step 5.3: it can't model interactions (e.g. recency
+# MAGIC matters differently for one-order vs loyal customers) unless we hand-craft them.
+
+# COMMAND ----------
+
+RUN_LOGREG = True
+LOGREG_RUN_ID = None  # paste after the first run
+
+if RUN_LOGREG:
+    from mlflow.models import infer_signature
+
+    mlflow.set_experiment(EXPERIMENT_PATH)
+    with mlflow.start_run(run_name="logreg_baseline") as parent:
+        mlflow.set_tags(
+            {
+                "phase": "5",
+                "kind": "baseline",
+                "model_type": "logistic_regression",
+                "training_set_run_id": TRAINING_SET_RUN_ID,
+                "selection_metric": "validation_pr_auc",
+            }
+        )
+        t0 = time.perf_counter()
+        grid = fit_logistic_grid(train.X, train.y, val.X, val.y, Cs=DEFAULT_C_GRID)
+        fit_seconds = round(time.perf_counter() - t0, 1)
+        for r in grid:
+            with mlflow.start_run(run_name=f"logreg_C{r.C}", nested=True):
+                mlflow.set_tags({"phase": "5", "kind": "baseline_trial"})
+                mlflow.log_param("C", r.C)
+                mlflow.log_metrics({**prefixed(r.train, "train"), **prefixed(r.validation, "validation")})
+        best = best_by(grid, "pr_auc")
+        model = best.model
+
+        p_train, p_val = positive_proba(model, train.X), positive_proba(model, val.X)
+        ev_train, ev_val = evaluate(train.y, p_train), evaluate(val.y, p_val)
+
+        example = train.X.dropna().head(5)
+        signature = infer_signature(example, model.predict_proba(example))
+        info = mlflow.sklearn.log_model(
+            model,
+            name="model",
+            signature=signature,
+            input_example=example,
+            pyfunc_predict_fn="predict_proba",
+        )
+
+        mlflow.log_params({"C": best.C, "C_grid": list(DEFAULT_C_GRID), "n_features": train.X.shape[1], "class_weight": "none"})
+        mlflow.log_metrics(
+            {
+                **prefixed(ev_train["metrics"], "train"),
+                **prefixed(ev_val["metrics"], "validation"),
+                **prefixed(rule_val["metrics"], "rule_validation"),
+                "fit_grid_seconds": fit_seconds,
+            }
+        )
+        coefs = coefficients(model)
+        mlflow.log_dict(
+            {
+                "model_uri": info.model_uri,
+                "validation": ev_val["metrics"],
+                "train": ev_train["metrics"],
+                "rule_validation": rule_val["metrics"],
+                "grid": [{"C": r.C, "validation": r.validation, "train": r.train} for r in grid],
+                "coefficients": coefs.round(6).to_dict(),
+                "gain_validation": json.loads(ev_val["gain"].to_json(orient="records")),
+                "calibration_validation": json.loads(ev_val["calibration"].to_json(orient="records")),
+            },
+            "evaluation/logreg.json",
+        )
+        scores = {"logreg": (val.y, p_val), "recency rule": (val.y, recency_rule_scores(val.X))}
+        figs = {
+            "roc_pr_validation": plot_roc_pr(scores, "Validation (cutoff 2011-06-13)"),
+            "gain_validation": plot_gain(scores, title="Cumulative gain (validation)"),
+            "lift_validation": plot_lift(scores, title="Lift by decile (validation)"),
+            "calibration_validation": plot_calibration({"logreg": (val.y, p_val)}, title="Calibration (validation)"),
+            "coefficients": plot_bars(coefs, "Logistic regression: standardised coefficients", "coefficient"),
+        }
+        for name, fig in figs.items():
+            mlflow.log_figure(fig, f"plots/{name}.png")
+        LOGREG_RUN_ID = parent.info.run_id
+
+logreg = mlflow.artifacts.load_dict(f"runs:/{LOGREG_RUN_ID}/evaluation/logreg.json")
+LOGREG_MODEL_URI = logreg["model_uri"]
+print("logreg run:", LOGREG_RUN_ID, "| model:", LOGREG_MODEL_URI)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.3 Results to paste into the chat
+# MAGIC
+# MAGIC Read the coefficients as "effect of +1 standard deviation of the (logged) feature on the
+# MAGIC log-odds, all else equal": correlated features (frequency, n_purchase_days, monetary)
+# MAGIC share credit, so single signs can look odd. SHAP on LightGBM (5.4) is the better
+# MAGIC explanation; the coefficients are a sanity check.
+
+# COMMAND ----------
+
+KEYS = ["roc_auc", "pr_auc", "base_rate", "pr_auc_lift", "capture_top_10pct", "capture_top_20pct", "capture_top_30pct", "brier", "log_loss", "ece"]
+
+
+def _fmt(m):
+    return " | ".join(f"{m[k]:.4f}" if isinstance(m.get(k), float) else str(m.get(k)) for k in KEYS)
+
+
+lines = ["### Phase 5.2 results", "", f"- logreg run: {LOGREG_RUN_ID}, model: {LOGREG_MODEL_URI}"]
+lines += ["", "| model / split | " + " | ".join(KEYS) + " |", "|---|" + "---:|" * len(KEYS)]
+lines += [f"| logreg train | {_fmt(logreg['train'])} |", f"| logreg validation | {_fmt(logreg['validation'])} |"]
+lines += [f"| recency rule validation | {_fmt(logreg['rule_validation'])} |"]
+lines += ["", "| C | train PR-AUC | validation PR-AUC | validation ROC-AUC | validation Brier |", "|---:|---:|---:|---:|---:|"]
+lines += [
+    f"| {g['C']} | {g['train']['pr_auc']:.4f} | {g['validation']['pr_auc']:.4f} | {g['validation']['roc_auc']:.4f} | {g['validation']['brier']:.4f} |"
+    for g in logreg["grid"]
+]
+top = sorted(logreg["coefficients"].items(), key=lambda kv: -abs(kv[1]))[:8]
+lines += ["", "- top coefficients: " + ", ".join(f"{k} {v:+.3f}" for k, v in top)]
+lines += ["", "| band | customers | positives | rate | lift | cum. share of buyers |", "|---:|---:|---:|---:|---:|---:|"]
+lines += [
+    f"| {g['band']} | {g['customers']:,} | {g['positives']:,} | {g['rate']:.3f} | {g['lift']:.2f} | {g['cum_positive_share']:.3f} |"
+    for g in logreg["gain_validation"]
+]
+lines += ["", "| calib. bin | mean predicted | observed |", "|---:|---:|---:|"]
+lines += [f"| {c['bin']} | {c['mean_predicted']:.3f} | {c['observed_rate']:.3f} |" for c in logreg["calibration_validation"]]
 print("\n".join(lines))
