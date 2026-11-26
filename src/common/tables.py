@@ -55,6 +55,18 @@ def user_experiment_path(user_email: str, name: str = SEGMENTATION_EXPERIMENT_NA
     return f"/Users/{user_email}/{name}"
 
 
+# Products (Phase 4) --------------------------------------------------------------------
+# Product feature table: one row per (stock_code, as_of_date), same feature-table pattern as
+# customers (PK with a TIMESERIES key, one snapshot per as_of_date).
+ML_PRODUCT_FEATURES = fq("ml", "product_features")
+GOLD_PRODUCT_SEGMENTS = fq("gold", "product_segments")
+GOLD_PRODUCT_ASSOCIATIONS = fq("gold", "product_associations")
+
+# One MLflow experiment for everything about products: clustering sweep/stability/final model
+# and the market-basket runs (thresholds, itemset counts, rules).
+PRODUCT_EXPERIMENT_NAME = "retail_product_intelligence"
+
+
 # Benchmarks (Phase 2) -----------------------------------------------------------------
 # A separate scratch schema keeps experiment tables out of the production layers: every
 # benchmark copy can be dropped with one `DROP SCHEMA retail.bench CASCADE` at the end.
