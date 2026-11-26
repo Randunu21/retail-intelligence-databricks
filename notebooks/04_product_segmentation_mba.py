@@ -668,8 +668,8 @@ MIN_SHARE = 0.03
 K_MIN = 3
 BISECTING_IMPL = "kmeans_splits"  # Phase 3 probe: Spark BisectingKMeans -> DBFS_DISABLED
 
-RUN_SWEEP = True
-SWEEP_RUN_ID = ""  # paste after the first run, then RUN_SWEEP = False
+RUN_SWEEP = False
+SWEEP_RUN_ID = "b37d8caeac6c4d9ea0f13c38321a0c5c"  # paste after the first run, then RUN_SWEEP = False
 
 common_params = {
     "as_of_date": str(AS_OF),
@@ -796,8 +796,8 @@ STABILITY_CANDIDATES = stability_candidates(
 )
 print("stability candidates:", STABILITY_CANDIDATES)
 
-RUN_STABILITY = True
-STABILITY_RUN_ID = ""  # paste after the first run, then RUN_STABILITY = False
+RUN_STABILITY = False
+STABILITY_RUN_ID = "7fdee340c9ef45d0a2e634f14ada3224"  # paste after the first run, then RUN_STABILITY = False
 
 if RUN_STABILITY:
     mlflow.set_experiment(EXPERIMENT_PATH)
