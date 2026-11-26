@@ -210,3 +210,252 @@ def threshold_sweep(
             )
             break
     return results
+
+
+# =============================================================================== rules (4.5)
+
+# Words that only name a colour (or finish): two products whose descriptions differ only by
+# these are colour variants (e.g. 85123A WHITE / 21733 RED HANGING HEART T-LIGHT HOLDER).
+COLOUR_WORDS: tuple[str, ...] = (
+    "RED",
+    "PINK",
+    "BLUE",
+    "WHITE",
+    "BLACK",
+    "GREEN",
+    "IVORY",
+    "CREAM",
+    "YELLOW",
+    "PURPLE",
+    "ORANGE",
+    "GREY",
+    "GRAY",
+    "BROWN",
+    "GOLD",
+    "SILVER",
+    "NATURAL",
+    "LILAC",
+    "TURQUOISE",
+    "AQUA",
+    "ROSE",
+    "MULTICOLOUR",
+    "COLOURED",
+    "ASSORTED",
+    "DARK",
+    "LIGHT",
+    "PASTEL",
+)
+# Filler words that don't identify a product type.
+STOP_WORDS: tuple[str, ...] = (
+    "SET", "OF", "PACK", "THE", "AND", "WITH", "IN", "A", "DESIGN", "SMALL", "LARGE", "MEDIUM",
+    "MINI", "BIG", "TO", "FOR",
+)  # fmt: skip
+SIMILARITY_THRESHOLD = 0.5  # token Jaccard >= 0.5 = the same kind of item in another design
+
+
+def description_tokens(description: Column) -> Column:
+    """Distinct, sorted words of a description without colours, filler words, numbers and
+    punctuation: 'LUNCH BAG RED RETROSPOT' -> [BAG, LUNCH, RETROSPOT]."""
+    words = F.split(F.trim(F.regexp_replace(F.upper(description), r"[^A-Z ]", " ")), r"\s+")
+    drop = F.array(*[F.lit(w) for w in (*COLOUR_WORDS, *STOP_WORDS)])
+    kept = F.filter(words, lambda w: (F.length(w) >= 2) & ~F.array_contains(drop, w))
+    return F.array_sort(F.array_distinct(kept))
+
+
+def product_lookup(descriptions: DataFrame) -> DataFrame:
+    """stock_code -> description, variant family, description tokens."""
+    return descriptions.select(
+        "stock_code",
+        "description",
+        variant_family(F.col("stock_code")).alias("family"),
+        description_tokens(F.col("description")).alias("tokens"),
+    )
+
+
+def min_count(min_support: float, n_baskets: int) -> int:
+    """Minimum number of baskets for an itemset, as Spark's FPGrowth computes it."""
+    import math
+
+    return int(math.ceil(min_support * n_baskets))
+
+
+def fit_rules(
+    baskets: DataFrame, min_support: float, min_confidence: float, max_rules: int = 200_000
+) -> dict:
+    """Fit FP-Growth and return the rules as plain rows (the fitted model is deleted).
+
+    Rules are collected to the driver (a few thousand rows at most at these thresholds) and
+    rebuilt with `rules_frame`, so nothing downstream references the server-side model.
+    """
+    from pyspark.ml.fpm import FPGrowth
+
+    n = baskets.count()
+    t0 = time.perf_counter()
+    model = FPGrowth(itemsCol=ITEMS_COL, minSupport=min_support, minConfidence=min_confidence).fit(
+        baskets.select(ITEMS_COL)
+    )
+    try:
+        n_itemsets = model.freqItemsets.count()
+        n_rules = model.associationRules.count()
+        if n_rules > max_rules:  # don't pull a huge result to the driver
+            raise ValueError(
+                f"{n_rules:,} rules > max_rules={max_rules:,}: raise min_support/min_confidence"
+            )
+        rules = [r.asDict() for r in model.associationRules.collect()]
+    finally:
+        del model
+    return {
+        "n_baskets": n,
+        "n_itemsets": int(n_itemsets),
+        "rules": rules,
+        "seconds": round(time.perf_counter() - t0, 2),
+    }
+
+
+RULE_SCHEMA = (
+    "antecedent ARRAY<STRING>, consequent ARRAY<STRING>, confidence DOUBLE, lift DOUBLE, "
+    "support DOUBLE"
+)
+
+
+def rules_frame(spark, rules: Sequence[dict], n_baskets: int, scope: str) -> DataFrame:
+    """Collected FP-Growth rules -> DataFrame with scope, sizes, basket counts and a rule id."""
+    rows = [
+        (list(r["antecedent"]), list(r["consequent"]), r["confidence"], r["lift"], r["support"])
+        for r in rules
+    ]
+    df = spark.createDataFrame(rows, RULE_SCHEMA)
+    return (
+        df.withColumn("scope", F.lit(scope))
+        .withColumn("n_baskets", F.lit(n_baskets))
+        .withColumn("antecedent_size", F.size("antecedent"))
+        .withColumn("consequent_item", F.element_at("consequent", 1))
+        .withColumn("baskets_with_rule", F.round(F.col("support") * F.lit(n_baskets)).cast("int"))
+        .withColumn(
+            "rule_id",
+            F.xxhash64(
+                F.col("scope"),
+                F.array_join("antecedent", ","),
+                F.array_join("consequent", ","),
+            ),
+        )
+    )
+
+
+def classify_rules(
+    rules: DataFrame, lookup: DataFrame, similarity_threshold: float = SIMILARITY_THRESHOLD
+) -> DataFrame:
+    """Add rule_type and description_similarity:
+
+    - `variant`: the consequent is a colour/design variant of an antecedent item (same stock
+      code family, or the same description once colour words are removed). Trivial: "people
+      who buy the red one also buy the white one" is not a cross-sell.
+    - `similar`: same kind of item in another design (token Jaccard >= threshold, e.g. LUNCH
+      BAG RETROSPOT -> LUNCH BAG SUKI). A "more designs" recommendation, kept but labelled.
+    - `complementary`: different products bought together (REGENCY CAKESTAND -> REGENCY TEA
+      PLATE): the classic cross-sell.
+    For multi-item antecedents the closest antecedent item decides.
+    """
+    lk = lookup.select("stock_code", "family", "tokens")
+    pairs = (
+        rules.select("rule_id", F.explode("antecedent").alias("a_item"), "consequent_item")
+        .join(
+            lk.select(
+                F.col("stock_code").alias("a_item"),
+                F.col("family").alias("a_family"),
+                F.col("tokens").alias("a_tokens"),
+            ),
+            "a_item",
+            "left",
+        )
+        .join(
+            lk.select(
+                F.col("stock_code").alias("consequent_item"),
+                F.col("family").alias("c_family"),
+                F.col("tokens").alias("c_tokens"),
+            ),
+            "consequent_item",
+            "left",
+        )
+    )
+    inter = F.size(F.array_intersect("a_tokens", "c_tokens"))
+    union = F.size(F.array_union("a_tokens", "c_tokens"))
+    jaccard = F.when(union > 0, inter / union).otherwise(F.lit(0.0))
+    is_variant = (F.col("a_family") == F.col("c_family")) | (
+        (F.size("a_tokens") > 0) & (F.col("a_tokens") == F.col("c_tokens"))
+    )
+    per_rule = pairs.groupBy("rule_id").agg(
+        F.max(F.coalesce(is_variant, F.lit(False))).alias("_variant"),
+        F.max(F.coalesce(jaccard, F.lit(0.0))).alias("description_similarity"),
+    )
+    rule_type = (
+        F.when(F.col("_variant"), F.lit("variant"))
+        .when(F.col("description_similarity") >= F.lit(similarity_threshold), F.lit("similar"))
+        .otherwise(F.lit("complementary"))
+    )
+    return (
+        rules.join(per_rule, "rule_id", "left").withColumn("rule_type", rule_type).drop("_variant")
+    )
+
+
+def pair_rules_sql(baskets: DataFrame, min_basket_count: int) -> DataFrame:
+    """Independent check: single-item rules a -> b computed with plain joins (no FP-Growth).
+
+    Only items in >= min_basket_count baskets can be in a frequent pair (Apriori property),
+    so baskets are reduced to those items before the self-join.
+    """
+    n = baskets.count()
+    exploded = baskets.select("invoice", F.explode(ITEMS_COL).alias("item"))
+    counts = exploded.groupBy("item").agg(F.count(F.lit(1)).alias("n_item"))
+    frequent = counts.where(F.col("n_item") >= min_basket_count)
+    kept = exploded.join(frequent.select("item"), "item")
+    a = kept.select("invoice", F.col("item").alias("a"))
+    b = kept.select("invoice", F.col("item").alias("b"))
+    pair = (
+        a.join(b, "invoice")
+        .where(F.col("a") < F.col("b"))
+        .groupBy("a", "b")
+        .agg(F.count(F.lit(1)).alias("n_ab"))
+        .where(F.col("n_ab") >= min_basket_count)
+    )
+    both_ways = pair.select("a", "b", "n_ab").unionByName(
+        pair.select(F.col("b").alias("a"), F.col("a").alias("b"), "n_ab")
+    )
+    ca = frequent.select(F.col("item").alias("a"), F.col("n_item").alias("n_a"))
+    cb = frequent.select(F.col("item").alias("b"), F.col("n_item").alias("n_b"))
+    return (
+        both_ways.join(ca, "a")
+        .join(cb, "b")
+        .select(
+            F.col("a").alias("antecedent_item"),
+            F.col("b").alias("consequent_item"),
+            (F.col("n_ab") / F.lit(n)).alias("support"),
+            (F.col("n_ab") / F.col("n_a")).alias("confidence"),
+            (F.col("n_ab") * F.lit(n) / (F.col("n_a") * F.col("n_b"))).alias("lift"),
+        )
+    )
+
+
+def compare_pair_rules(fp_rules: DataFrame, sql_rules: DataFrame, min_confidence: float) -> dict:
+    """FP-Growth single-item rules vs the SQL recount (same min confidence): both sets must be
+    identical and the measures equal up to floating point."""
+    fp = fp_rules.where(F.col("antecedent_size") == 1).select(
+        F.element_at("antecedent", 1).alias("antecedent_item"),
+        "consequent_item",
+        F.col("support").alias("fp_support"),
+        F.col("confidence").alias("fp_confidence"),
+        F.col("lift").alias("fp_lift"),
+    )
+    sq = sql_rules.where(F.col("confidence") >= F.lit(min_confidence))
+    joined = fp.join(sq, ["antecedent_item", "consequent_item"], "full_outer")
+    row = joined.agg(
+        F.sum(F.col("fp_support").isNotNull().cast("int")).alias("fp_pair_rules"),
+        F.sum(F.col("support").isNotNull().cast("int")).alias("sql_pair_rules"),
+        F.sum((F.col("fp_support").isNull() | F.col("support").isNull()).cast("int")).alias(
+            "unmatched"
+        ),
+        F.max(F.abs(F.col("fp_support") - F.col("support"))).alias("max_support_diff"),
+        F.max(F.abs(F.col("fp_confidence") - F.col("confidence"))).alias("max_confidence_diff"),
+        F.max(F.abs(F.col("fp_lift") - F.col("lift"))).alias("max_lift_diff"),
+    ).first()
+    return {k: row[k] for k in row.asDict()}

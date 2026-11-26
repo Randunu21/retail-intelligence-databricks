@@ -18,7 +18,7 @@
 # MAGIC | 3 | **Product clustering**: long-tail rule, preprocessing, KMeans / bisecting / GMM sweep, stability, final choice | 4.2 |
 # MAGIC | 4 | **Final model, profiles, names, action groups**, `retail.gold.product_segments` | 4.3 |
 # MAGIC | 5 | **Baskets and thresholds**: basket sizes, item support, FP-Growth threshold sweep | 4.4 |
-# MAGIC | 6 | Association rules, `retail.gold.product_associations` (4.5) | 4.5 |
+# MAGIC | 6 | **Association rules**: thresholds, FP-Growth (all / UK / rest), SQL cross-check, variant filter, `retail.gold.product_associations` | 4.5 |
 # MAGIC | 7 | Generated `docs/product_insights.md` (4.6) | 4.6 |
 # MAGIC
 # MAGIC Logic lives in `src/features/` and `src/segmentation/` (unit-tested); this notebook runs it
@@ -1603,8 +1603,8 @@ display(
 # COMMAND ----------
 
 SWEEP_MIN_CONFIDENCE = 0.1
-RUN_MBA_SWEEP = True
-MBA_SWEEP_RUN_ID = ""  # paste after the first run, then RUN_MBA_SWEEP = False
+RUN_MBA_SWEEP = False
+MBA_SWEEP_RUN_ID = "d859f0327108469a808387b27c5d8ac6"  # recorded 2026-11-26
 
 if RUN_MBA_SWEEP:
     mlflow.set_experiment(EXPERIMENT_PATH)
@@ -1720,4 +1720,322 @@ for r in mba_sweep:
     lines.append("| " + " | ".join(fmt(r.get(c)) for c in mcols) + " |")
 stopped = [r.get("stopped_sweep") for r in mba_sweep if r.get("stopped_sweep")]
 lines.append(f"- stopped early: {stopped or 'no'}")
+print("\n".join(lines))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6. Association rules
+# MAGIC
+# MAGIC ### 6.1 Thresholds (chosen from the 5.3 sweep)
+# MAGIC
+# MAGIC | Parameter | Value | Why |
+# MAGIC |---|---|---|
+# MAGIC | `minSupport` | **0.01** (≥ 396 of 39,516 baskets) | 707 products can take part, 533 frequent pairs, 109 triples. 0.02 finds only 58 pairs (too few to cover the range); 0.005 finds 14.5k rules backed by as few as ~198 orders (too many to act on, weaker evidence each). The fit takes ~30 s, so compute isn't the constraint; evidence and actionability are. |
+# MAGIC | `minConfidence` | **0.3** | the recommendation "add B?" is right for at least 3 in 10 baskets with A (sweep median at 0.01 was 0.39) |
+# MAGIC | `min_lift` | **2** (for `is_recommendable`) | B at least twice as likely with A as in any basket. All rules have lift > 1 already (median 7.5); 2 removes "B is just popular" rules |
+# MAGIC
+# MAGIC **Long tail**: the support threshold *is* the long-tail rule here. 707 of 4,725 products
+# MAGIC (15 %) are frequent enough for rules; the rest get no item-level rules, which is honest:
+# MAGIC 20 co-purchases can't support a recommendation. For them, segment-level fallbacks (e.g.
+# MAGIC recommend Core best-sellers) are the realistic option.
+# MAGIC
+# MAGIC **Scopes**: rules mined separately in **all** baskets, **UK** (36,184) and **rest of
+# MAGIC world** (3,332). The same relative support means ≥ 34 baskets per rule for the rest of the
+# MAGIC world: weaker evidence, flagged in the comparison. Mining per scope (instead of filtering
+# MAGIC global rules by country) finds associations that only exist abroad.
+# MAGIC
+# MAGIC **Trivial rules** (`classify_rules`): `variant` = the consequent is a colour/design
+# MAGIC variant of an antecedent item (same stock-code family like 85099B/85099C, or the same
+# MAGIC description once colour words are removed). Kept in the table, but `is_recommendable =
+# MAGIC false`. `similar` = same kind of item in another design (lunch bag retrospot → lunch bag
+# MAGIC suki): a valid "more designs" suggestion, labelled. `complementary` = the classic
+# MAGIC cross-sell.
+
+# COMMAND ----------
+
+from common.tables import GOLD_PRODUCT_ASSOCIATIONS
+from segmentation.association_outputs import (
+    associations_ddl,
+    build_associations_output,
+    top_rules,
+    write_associations,
+)
+from segmentation.market_basket import (
+    classify_rules,
+    compare_pair_rules,
+    fit_rules,
+    min_count,
+    pair_rules_sql,
+    product_lookup,
+    rules_frame,
+)
+
+MIN_SUPPORT = 0.01
+MIN_CONFIDENCE = 0.3
+MIN_LIFT = 2.0
+SCOPES = {
+    "all": baskets,
+    "UK": baskets.where(F.col("country") == "United Kingdom"),
+    "rest": baskets.where(F.col("country") != "United Kingdom"),
+}
+lookup = product_lookup(spark.table(GOLD_DIM_PRODUCT)).cache()
+
+# Set RUN_MBA_RULES = False and paste the run id after the first run: the rules are then read
+# back from gold.product_associations instead of re-mined.
+RUN_MBA_RULES = True
+MBA_RULES_RUN_ID = ""
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6.2 Mine the rules (one FP-Growth fit per scope) and check them independently
+# MAGIC
+# MAGIC **Cross-check**: every single-item rule FP-Growth returns for *all* baskets is recomputed
+# MAGIC with plain Spark joins (`pair_rules_sql`: count pairs among frequent items, divide). The
+# MAGIC two rule sets must be identical and support / confidence / lift equal to floating point.
+# MAGIC This proves both the serverless FP-Growth output and our reading of its measures.
+
+# COMMAND ----------
+
+if RUN_MBA_RULES:
+    fits, frames = {}, []
+    for scope, scope_baskets in SCOPES.items():
+        fits[scope] = fit_rules(scope_baskets, MIN_SUPPORT, MIN_CONFIDENCE)
+        f = fits[scope]
+        print(
+            f"{scope:5s} baskets {f['n_baskets']:6,d} (min count {min_count(MIN_SUPPORT, f['n_baskets'])}) "
+            f"itemsets {f['n_itemsets']:5,d} rules {len(f['rules']):5,d} ({f['seconds']} s)"
+        )
+        frames.append(rules_frame(spark, f["rules"], f["n_baskets"], scope))
+    rules = frames[0]
+    for f in frames[1:]:
+        rules = rules.unionByName(f)
+    classified = classify_rules(rules, lookup).cache()
+
+    sql_pairs = pair_rules_sql(SCOPES["all"], min_count(MIN_SUPPORT, fits["all"]["n_baskets"]))
+    CROSS_CHECK = compare_pair_rules(
+        classified.where(F.col("scope") == "all"), sql_pairs, MIN_CONFIDENCE
+    )
+    print("cross-check FP-Growth vs SQL (pair rules, all):", CROSS_CHECK)
+    assert CROSS_CHECK["unmatched"] == 0, (
+        "FP-Growth and the SQL recount disagree on which rules exist"
+    )
+    assert CROSS_CHECK["max_support_diff"] < 1e-9 and CROSS_CHECK["max_confidence_diff"] < 1e-9
+    assert CROSS_CHECK["max_lift_diff"] < 1e-6
+    print("FP-Growth pair rules == independent SQL recount")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6.3 Write `retail.gold.product_associations` and log to MLflow
+
+# COMMAND ----------
+
+if RUN_MBA_RULES:
+    mlflow.set_experiment(EXPERIMENT_PATH)
+    with mlflow.start_run(run_name="mba_rules") as rules_run:
+        mlflow.set_tags({"phase": "4", "kind": "mba_rules", "sweep_run_id": MBA_SWEEP_RUN_ID})
+        mlflow.log_params(
+            {
+                "as_of_date": str(AS_OF),
+                "min_support": MIN_SUPPORT,
+                "min_confidence": MIN_CONFIDENCE,
+                "min_lift": MIN_LIFT,
+                "scopes": ",".join(SCOPES),
+            }
+        )
+        for scope, f in fits.items():
+            mlflow.log_metrics(
+                {
+                    f"{scope}_baskets": f["n_baskets"],
+                    f"{scope}_itemsets": f["n_itemsets"],
+                    f"{scope}_rules": len(f["rules"]),
+                    f"{scope}_seconds": f["seconds"],
+                }
+            )
+        mlflow.log_dict(CROSS_CHECK, "rules/cross_check_vs_sql.json")
+    MBA_RULES_RUN_ID = rules_run.info.run_id
+
+    spark.sql(associations_ddl(GOLD_PRODUCT_ASSOCIATIONS))
+    segments_now = spark.table(GOLD_PRODUCT_SEGMENTS).where(snapshot_predicate(AS_OF))
+    assoc_out = build_associations_output(
+        classified,
+        lookup,
+        segments_now,
+        as_of=AS_OF,
+        min_support=MIN_SUPPORT,
+        min_confidence=MIN_CONFIDENCE,
+        min_lift=MIN_LIFT,
+        run_id=MBA_RULES_RUN_ID,
+    )
+    write_associations(assoc_out, GOLD_PRODUCT_ASSOCIATIONS, AS_OF)
+print("rules run:", MBA_RULES_RUN_ID)
+
+assoc = spark.table(GOLD_PRODUCT_ASSOCIATIONS).where(snapshot_predicate(AS_OF)).cache()
+assoc_checks = (
+    assoc.agg(
+        F.count(F.lit(1)).alias("rows"),
+        F.countDistinct("rule_id").alias("rule_ids"),
+        F.sum(F.col("consequent_description").isNull().cast("int")).alias("null_descriptions"),
+        F.sum(F.col("consequent_segment").isNull().cast("int")).alias("null_segments"),
+        F.min("confidence").alias("min_confidence"),
+        F.min("lift").alias("min_lift"),
+        F.countDistinct("mlflow_run_id").alias("runs"),
+    )
+    .first()
+    .asDict()
+)
+print(assoc_checks)
+assert assoc_checks["rows"] == assoc_checks["rule_ids"], "duplicate rule ids"
+assert assoc_checks["min_confidence"] >= MIN_CONFIDENCE - 1e-12 and assoc_checks["runs"] == 1
+
+by_scope = (
+    assoc.groupBy("scope", "rule_type")
+    .agg(
+        F.count(F.lit(1)).alias("rules"),
+        F.sum(F.col("is_recommendable").cast("int")).alias("recommendable"),
+        F.percentile_approx("lift", 0.5, 10000).alias("median_lift"),
+        F.percentile_approx("confidence", 0.5, 10000).alias("median_confidence"),
+    )
+    .orderBy("scope", "rule_type")
+)
+display(by_scope)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6.4 Examples per rule type, and the top rules
+# MAGIC
+# MAGIC Check by eye that `variant` really are colour/design versions of one item and
+# MAGIC `complementary` really are different products. Then the top recommendable rules (all
+# MAGIC baskets), by lift and by confidence, one rule per antecedent so one item can't fill the
+# MAGIC list.
+
+# COMMAND ----------
+
+show_cols = [
+    "antecedent_descriptions",
+    "consequent_description",
+    "support",
+    "confidence",
+    "lift",
+    "baskets_with_rule",
+    "rule_type",
+    "description_similarity",
+    "consequent_segment",
+]
+for t in ["variant", "similar", "complementary"]:
+    print(t)
+    display(
+        assoc.where((F.col("scope") == "all") & (F.col("rule_type") == t))
+        .orderBy(F.col("lift").desc())
+        .select(*show_cols)
+        .limit(8)
+    )
+
+top_by_lift = top_rules(assoc, "all", 25, "lift").toPandas()
+top_by_conf = top_rules(assoc, "all", 25, "confidence").toPandas()
+display(top_by_lift[show_cols])
+display(top_by_conf[show_cols])
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6.5 UK vs the rest of the world
+# MAGIC
+# MAGIC Same rule = same antecedent and consequent. Rules found **only abroad** are the
+# MAGIC interesting ones (different assortments or occasions); remember each rest-of-world rule
+# MAGIC rests on ≥ 34 baskets.
+
+# COMMAND ----------
+
+
+def _keys(scope):
+    return (
+        assoc.where((F.col("scope") == scope) & F.col("is_recommendable"))
+        .select(F.array_join("antecedent", ",").alias("a"), "consequent")
+        .distinct()
+    )
+
+
+uk_keys, rest_keys = _keys("UK"), _keys("rest")
+MARKET_OVERLAP = {
+    "uk_rules": uk_keys.count(),
+    "rest_rules": rest_keys.count(),
+    "in_both": uk_keys.join(rest_keys, ["a", "consequent"]).count(),
+}
+MARKET_OVERLAP["rest_only"] = MARKET_OVERLAP["rest_rules"] - MARKET_OVERLAP["in_both"]
+print(MARKET_OVERLAP)
+
+rest_only = (
+    assoc.where((F.col("scope") == "rest") & F.col("is_recommendable"))
+    .withColumn("a", F.array_join("antecedent", ","))
+    .join(uk_keys, ["a", "consequent"], "left_anti")
+)
+rest_only_top = top_rules(rest_only, "rest", 15, "lift").toPandas()
+display(rest_only_top[show_cols])
+
+with mlflow.start_run(run_id=MBA_RULES_RUN_ID):
+    mlflow.log_dict(MARKET_OVERLAP, "rules/market_overlap.json")
+    mlflow.log_text(by_scope.toPandas().to_csv(index=False), "rules/rules_by_scope_type.csv")
+    mlflow.log_text(top_by_lift.to_csv(index=False), "rules/top_by_lift.csv")
+    mlflow.log_text(top_by_conf.to_csv(index=False), "rules/top_by_confidence.csv")
+    mlflow.log_text(rest_only_top.to_csv(index=False), "rules/rest_only_top.csv")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6.6 What to share back (step 4.5)
+
+# COMMAND ----------
+
+
+def _rule_line(r):
+    return (
+        f"- {r['antecedent_descriptions']} -> {r['consequent_description']} | sup {r['support']:.4f} "
+        f"({r['baskets_with_rule']}) conf {r['confidence']:.3f} lift {r['lift']:.2f} | {r['rule_type']} | {r['consequent_segment']}"
+    )
+
+
+lines = [
+    "### 4.5 results",
+    "",
+    f"- rules run: {MBA_RULES_RUN_ID}",
+    f"- gold checks: {assoc_checks}",
+]
+if RUN_MBA_RULES:
+    lines.append(f"- cross-check vs SQL: {CROSS_CHECK}")
+    lines += [
+        f"- {s}: {f['n_baskets']:,} baskets, {f['n_itemsets']:,} itemsets, {len(f['rules']):,} rules, {f['seconds']} s"
+        for s, f in fits.items()
+    ]
+lines += [
+    "",
+    "| scope | rule_type | rules | recommendable | median_lift | median_confidence |",
+    "|---|---|---|---|---|---|",
+]
+for r in by_scope.collect():
+    lines.append(
+        f"| {r['scope']} | {r['rule_type']} | {r['rules']} | {r['recommendable']} | {r['median_lift']:.2f} | {r['median_confidence']:.3f} |"
+    )
+lines += ["", f"- market overlap: {MARKET_OVERLAP}"]
+for t in ["variant", "similar", "complementary"]:
+    lines += ["", f"**Examples: {t}**"]
+    for r in (
+        assoc.where((F.col("scope") == "all") & (F.col("rule_type") == t))
+        .orderBy(F.col("lift").desc())
+        .limit(5)
+        .collect()
+    ):
+        lines.append(_rule_line(r))
+lines += ["", "**Top 25 by lift (all, one per antecedent)**"] + [
+    _rule_line(r) for r in top_by_lift.to_dict("records")
+]
+lines += ["", "**Top 25 by confidence (all, one per antecedent)**"] + [
+    _rule_line(r) for r in top_by_conf.to_dict("records")
+]
+lines += ["", "**Top 15 rest-of-world-only rules**"] + [
+    _rule_line(r) for r in rest_only_top.to_dict("records")
+]
 print("\n".join(lines))
