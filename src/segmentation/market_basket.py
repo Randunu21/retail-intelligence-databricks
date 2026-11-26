@@ -250,7 +250,11 @@ STOP_WORDS: tuple[str, ...] = (
     "SET", "OF", "PACK", "THE", "AND", "WITH", "IN", "A", "DESIGN", "SMALL", "LARGE", "MEDIUM",
     "MINI", "BIG", "TO", "FOR",
 )  # fmt: skip
-SIMILARITY_THRESHOLD = 0.5  # token Jaccard >= 0.5 = the same kind of item in another design
+# Token Jaccard >= 1/3 = the same range / kind of item in another design. Phase 4 first run used
+# 0.5, which missed short descriptions that share 1 of 3 or 2 of 5 words (POLKADOT CUP vs
+# RETROSPOT CUP, KEY FOB BACK DOOR vs KEY FOB GARAGE, HAND WARMER SCOTTY DOG vs OWL), so the
+# "complementary" list was mostly design variants. Recalibrated on those real examples.
+SIMILARITY_THRESHOLD = 1 / 3
 
 
 def description_tokens(description: Column) -> Column:
@@ -350,8 +354,9 @@ def classify_rules(
     - `variant`: the consequent is a colour/design variant of an antecedent item (same stock
       code family, or the same description once colour words are removed). Trivial: "people
       who buy the red one also buy the white one" is not a cross-sell.
-    - `similar`: same kind of item in another design (token Jaccard >= threshold, e.g. LUNCH
-      BAG RETROSPOT -> LUNCH BAG SUKI). A "more designs" recommendation, kept but labelled.
+    - `similar`: same range or kind of item in another design (token Jaccard >= threshold,
+      default 1/3; e.g. LUNCH BAG RETROSPOT -> LUNCH BAG SUKI, POLKADOT CUP -> RETROSPOT CUP).
+      A "complete the collection" recommendation, kept but labelled.
     - `complementary`: different products bought together (REGENCY CAKESTAND -> REGENCY TEA
       PLATE): the classic cross-sell.
     For multi-item antecedents the closest antecedent item decides.

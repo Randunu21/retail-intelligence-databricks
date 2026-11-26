@@ -1748,9 +1748,14 @@ print("\n".join(lines))
 # MAGIC **Trivial rules** (`classify_rules`): `variant` = the consequent is a colour/design
 # MAGIC variant of an antecedent item (same stock-code family like 85099B/85099C, or the same
 # MAGIC description once colour words are removed). Kept in the table, but `is_recommendable =
-# MAGIC false`. `similar` = same kind of item in another design (lunch bag retrospot → lunch bag
-# MAGIC suki): a valid "more designs" suggestion, labelled. `complementary` = the classic
-# MAGIC cross-sell.
+# MAGIC false`. `similar` = same range or kind of item in another design (lunch bag retrospot →
+# MAGIC lunch bag suki, polkadot cup → retrospot cup): a "complete the collection" suggestion,
+# MAGIC labelled. `complementary` = different product types bought together.
+# MAGIC
+# MAGIC **Recalibration (2026-11-26):** `similar` needs a description-word Jaccard ≥ **1/3**.
+# MAGIC The first run used 0.5; its "complementary" top list was mostly design variants with
+# MAGIC short descriptions (cups, key fobs, hand warmers share 1 of 3 or 2 of 5 words). The
+# MAGIC first run (`37226335…`) stays in MLflow; this rule change is logged as a parameter.
 
 # COMMAND ----------
 
@@ -1762,6 +1767,7 @@ from segmentation.association_outputs import (
     write_associations,
 )
 from segmentation.market_basket import (
+    SIMILARITY_THRESHOLD,
     classify_rules,
     compare_pair_rules,
     fit_rules,
@@ -1783,8 +1789,10 @@ lookup = product_lookup(spark.table(GOLD_DIM_PRODUCT)).cache()
 
 # Set RUN_MBA_RULES = False and paste the run id after the first run: the rules are then read
 # back from gold.product_associations instead of re-mined.
-RUN_MBA_RULES = False
-MBA_RULES_RUN_ID = "37226335bd5a468f9bad47bae744c20d"  # recorded 2026-11-26
+# First run 37226335bd5a468f9bad47bae744c20d used similarity threshold 0.5 (superseded, kept
+# in MLflow as evidence). Re-run with the recalibrated 1/3, then paste the new id here.
+RUN_MBA_RULES = True
+MBA_RULES_RUN_ID = ""
 
 # COMMAND ----------
 
@@ -1843,6 +1851,8 @@ if RUN_MBA_RULES:
                 "min_confidence": MIN_CONFIDENCE,
                 "min_lift": MIN_LIFT,
                 "scopes": ",".join(SCOPES),
+                "similarity_threshold": round(SIMILARITY_THRESHOLD, 4),
+                "supersedes_run": "37226335bd5a468f9bad47bae744c20d",
             }
         )
         for scope, f in fits.items():
@@ -2145,8 +2155,9 @@ caveats = [
     "so 'seasonal' means > 50 %.",
     "Product clusters are less separated than customer segments; the bootstrap stability bar was lowered after "
     "seeing the data (recorded as a deviation in MLflow).",
-    "Rule types come from stock-code families and description words; the data has no category hierarchy, so a few "
-    "same-range items are labelled complementary (e.g. key fobs).",
+    "Rule types come from stock-code families and description words (similar = word Jaccard >= 1/3, recalibrated "
+    "after the first run's complementary list turned out to be mostly design variants); the data has no category "
+    "hierarchy, so some same-range pairs with different product words stay complementary (e.g. sugar bowl -> milk jug).",
     f"Rest-of-world rules rest on as few as {min_count(MIN_SUPPORT, scope_baskets.get('rest', 0))} baskets; test them "
     "before rolling out.",
     "Rules describe co-purchase, not cause: validate recommendations with an A/B test (attach rate, basket value).",

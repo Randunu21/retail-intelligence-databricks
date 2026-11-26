@@ -33,6 +33,12 @@ DESCRIPTIONS = [
     ("22697", "GREEN REGENCY TEACUP AND SAUCER"),
     ("22699", "ROSES REGENCY TEACUP AND SAUCER"),
     ("85123A", "WHITE HANGING HEART T-LIGHT HOLDER"),
+    ("20676", "RED RETROSPOT CUP"),
+    ("20677", "PINK POLKADOT CUP"),
+    ("21218", "RED RETROSPOT SUGAR JAM BOWL"),
+    ("21219", "RED RETROSPOT SMALL MILK JUG"),
+    ("23175", "KEY FOB , BACK DOOR"),
+    ("23176", "KEY FOB , GARAGE DESIGN"),
     ("21733", "RED HANGING HEART T-LIGHT HOLDER"),
 ]
 
@@ -133,6 +139,12 @@ def test_classify_rules(spark, lookup):
     assert r["rule_type"] == "similar" and r["description_similarity"] == pytest.approx(0.5)
     # teacups in two designs: {REGENCY, TEACUP, SAUCER} vs {ROSES, REGENCY, TEACUP, SAUCER}
     assert _rule(spark, lookup, ["22697"], "22699")["rule_type"] == "similar"
+    # short descriptions sharing 1 of 3 / 2 of 5 words (Phase 4 recalibration to 1/3)
+    r = _rule(spark, lookup, ["20677"], "20676")  # {POLKADOT, CUP} vs {RETROSPOT, CUP}
+    assert r["rule_type"] == "similar" and r["description_similarity"] == pytest.approx(1 / 3)
+    assert _rule(spark, lookup, ["23175"], "23176")["rule_type"] == "similar"  # 2/5
+    # same range but different product types stays complementary: 1/6
+    assert _rule(spark, lookup, ["21218"], "21219")["rule_type"] == "complementary"
     # cakestand -> teacup: complementary
     assert _rule(spark, lookup, ["22423"], "22697")["rule_type"] == "complementary"
     # multi-item antecedent: the closest item decides (85099B is the same family)
