@@ -1791,8 +1791,8 @@ lookup = product_lookup(spark.table(GOLD_DIM_PRODUCT)).cache()
 # back from gold.product_associations instead of re-mined.
 # First run 37226335bd5a468f9bad47bae744c20d used similarity threshold 0.5 (superseded, kept
 # in MLflow as evidence). Re-run with the recalibrated 1/3, then paste the new id here.
-RUN_MBA_RULES = True
-MBA_RULES_RUN_ID = ""
+RUN_MBA_RULES = False
+MBA_RULES_RUN_ID = "7057220d2ff34671a9d85b6e2dbd2278"
 
 # COMMAND ----------
 

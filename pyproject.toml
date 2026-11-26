@@ -27,7 +27,8 @@ ignore = ["E501"]  # long lines are handled by the formatter
 [tool.ruff.lint.per-file-ignores]
 # Databricks notebooks (.py source format): `spark`, `dbutils`, `display` are injected
 # globals, and imports come after the sys.path bootstrap cell.
-"notebooks/**/*.py" = ["F821", "E402", "I001"]
+# W292: the Databricks Git folder strips the final newline whenever it saves a notebook.
+"notebooks/**/*.py" = ["F821", "E402", "I001", "W292"]
 "tests/**/*.py" = ["B011"]
 # Lakeflow pipeline sources: `spark` is injected, imports follow the sys.path bootstrap.
 "pipelines/**/*.py" = ["F821", "E402", "I001"]
