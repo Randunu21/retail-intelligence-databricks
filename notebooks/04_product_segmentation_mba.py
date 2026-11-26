@@ -17,7 +17,7 @@
 # MAGIC | 2 | **Product feature table** `retail.ml.product_features` + long-tail analysis | 4.1 |
 # MAGIC | 3 | **Product clustering**: long-tail rule, preprocessing, KMeans / bisecting / GMM sweep, stability, final choice | 4.2 |
 # MAGIC | 4 | **Final model, profiles, names, action groups**, `retail.gold.product_segments` | 4.3 |
-# MAGIC | 5 | Baskets and frequent itemsets (4.4) | 4.4 |
+# MAGIC | 5 | **Baskets and thresholds**: basket sizes, item support, FP-Growth threshold sweep | 4.4 |
 # MAGIC | 6 | Association rules, `retail.gold.product_associations` (4.5) | 4.5 |
 # MAGIC | 7 | Generated `docs/product_insights.md` (4.6) | 4.6 |
 # MAGIC
@@ -1510,4 +1510,214 @@ for g in groups:
         f"| {g['segment_name']} | {g['action_group']} | {g['products']:,} | {g['product_share']:.3f} | {g['revenue_share']:.3f} | "
         f"{fmt(g['median_units_per_week'])} | {fmt(g['median_price'])} | {g['median_days_since_last_sale']} | {fmt(g['median_q4_share'])} | {fmt(g['pct_high_return'])} |"
     )
+print("\n".join(lines))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5. Market basket analysis: baskets and thresholds
+# MAGIC
+# MAGIC **Basket** = the distinct products on one invoice (`silver.sales`: already non-cancelled,
+# MAGIC product codes only). Anonymous invoices are real baskets and stay in; single-item
+# MAGIC invoices stay in the denominator of support. Definitions of support / confidence / lift
+# MAGIC and FP-Growth vs Apriori: docstring of `src/segmentation/market_basket.py`.
+# MAGIC
+# MAGIC In business terms, for "customers who buy A also buy B":
+# MAGIC - **support** = how many orders the pair is in (is it worth a campaign?),
+# MAGIC - **confidence** = of orders with A, how many also have B (the hit rate of the
+# MAGIC   recommendation "add B?"),
+# MAGIC - **lift** = how much more likely B is with A than in any order (is it a real affinity,
+# MAGIC   or is B just popular?). A best-seller in 10 % of orders gets 10 % confidence from *any*
+# MAGIC   product; lift exposes that (lift ≈ 1).
+# MAGIC
+# MAGIC This step measures the data before choosing `minSupport` / `minConfidence` (4.5).
+# MAGIC
+# MAGIC ### 5.1 Baskets
+
+# COMMAND ----------
+
+from segmentation.market_basket import (
+    basket_size_summary,
+    build_baskets,
+    item_support,
+    items_above_support,
+    threshold_sweep,
+)
+
+baskets = build_baskets(sales, as_of=AS_OF).cache()
+basket_stats = basket_size_summary(baskets)
+for k, v in basket_stats.items():
+    print(f"{k:22s} {v:,.4f}" if isinstance(v, float) else f"{k:22s} {v:,}")
+
+by_market = (
+    baskets.groupBy(
+        F.when(F.col("country") == "United Kingdom", "UK").otherwise("rest").alias("market")
+    )
+    .agg(F.count(F.lit(1)).alias("baskets"), F.mean("n_items").alias("mean_items"))
+    .orderBy("market")
+)
+display(by_market)
+display(
+    baskets.orderBy(F.col("n_items").desc())
+    .select("invoice", "n_items", "country", "has_customer")
+    .limit(10)
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5.2 Item support: the long tail again
+# MAGIC
+# MAGIC By the Apriori property, an itemset can only be frequent if *every* item in it is
+# MAGIC frequent. So the number of products above a support threshold bounds the whole search,
+# MAGIC and the threshold is also how the long tail is handled in basket analysis: a product in
+# MAGIC 20 of 39k orders can't support a reliable rule.
+
+# COMMAND ----------
+
+SWEEP_SUPPORTS = [0.03, 0.02, 0.015, 0.01, 0.0075, 0.005]
+support = item_support(baskets).cache()
+above = items_above_support(support, SWEEP_SUPPORTS)
+for t, n in above.items():
+    print(f"support >= {t:<7} ({t * basket_stats['baskets']:6.0f} baskets): {n:5,d} products")
+display(
+    support.join(
+        spark.table(GOLD_DIM_PRODUCT).select("stock_code", "description"), "stock_code", "left"
+    )
+    .orderBy(F.col("basket_count").desc())
+    .limit(20)
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5.3 FP-Growth threshold sweep
+# MAGIC
+# MAGIC One FP-Growth fit per `minSupport` (high → low), with a low `minConfidence` (0.1) so the
+# MAGIC counts show what's available. For each: frequent items / pairs / triples, rules, rules
+# MAGIC with lift > 1, median lift and confidence, frequent pairs that are **colour/design
+# MAGIC variants** of one product (same stock code family, e.g. 85099B/85099C), and seconds.
+# MAGIC Stops early if a fit takes > 5 min or finds > 200k itemsets (Free Edition daily quota).
+# MAGIC Set `RUN_MBA_SWEEP = False` and paste the run id after the first run.
+
+# COMMAND ----------
+
+SWEEP_MIN_CONFIDENCE = 0.1
+RUN_MBA_SWEEP = True
+MBA_SWEEP_RUN_ID = ""  # paste after the first run, then RUN_MBA_SWEEP = False
+
+if RUN_MBA_SWEEP:
+    mlflow.set_experiment(EXPERIMENT_PATH)
+    with mlflow.start_run(run_name="mba_threshold_sweep") as mba_run:
+        mlflow.set_tags({"phase": "4", "kind": "mba_threshold_sweep"})
+        mlflow.log_params(
+            {
+                "as_of_date": str(AS_OF),
+                "baskets": basket_stats["baskets"],
+                "supports": ",".join(map(str, SWEEP_SUPPORTS)),
+                "min_confidence": SWEEP_MIN_CONFIDENCE,
+            }
+        )
+        mlflow.log_dict(basket_stats, "baskets/basket_stats.json")
+        mlflow.log_dict({str(k): v for k, v in above.items()}, "baskets/items_above_support.json")
+        mba_sweep = threshold_sweep(
+            baskets,
+            SWEEP_SUPPORTS,
+            SWEEP_MIN_CONFIDENCE,
+            on_result=lambda r: print(
+                f"support {r['min_support']:<7} items {r.get('frequent_items')} pairs {r.get('frequent_pairs')} "
+                f"triples {r.get('frequent_triples')} rules {r.get('rules')} ({r['seconds']} s) error={r['error']}"
+            ),
+        )
+        mlflow.log_dict({"results": mba_sweep}, "sweep/results.json")
+    MBA_SWEEP_RUN_ID = mba_run.info.run_id
+else:
+    mba_sweep = mlflow.artifacts.load_dict(f"runs:/{MBA_SWEEP_RUN_ID}/sweep/results.json")[
+        "results"
+    ]
+print("MBA sweep run:", MBA_SWEEP_RUN_ID)
+
+mba_table = pd.DataFrame(
+    [{k: v for k, v in r.items() if k != "itemsets_by_size"} for r in mba_sweep]
+)
+display(mba_table)
+
+# COMMAND ----------
+
+import matplotlib.pyplot as plt
+
+ok = [r for r in mba_sweep if not r["error"]]
+fig_mba, ax = plt.subplots(1, 2, figsize=(11, 3.8))
+xs = [r["min_support"] for r in ok]
+for key in ["frequent_items", "frequent_pairs", "frequent_triples", "rules_lift_gt_1"]:
+    ax[0].plot(xs, [max(r[key], 0.5) for r in ok], marker="o", label=key)
+ax[0].set_xscale("log")
+ax[0].set_yscale("log")
+ax[0].invert_xaxis()
+ax[0].set_xlabel("minSupport (log, decreasing)")
+ax[0].set_ylabel("count (log)")
+ax[0].legend(fontsize=8)
+ax[0].set_title("What each threshold finds")
+ax[1].plot(xs, [r["seconds"] for r in ok], marker="o")
+ax[1].set_xscale("log")
+ax[1].invert_xaxis()
+ax[1].set_xlabel("minSupport (log, decreasing)")
+ax[1].set_ylabel("seconds (fit + counting)")
+ax[1].set_title("Cost on serverless")
+fig_mba.tight_layout()
+display(fig_mba)
+with mlflow.start_run(run_id=MBA_SWEEP_RUN_ID):
+    mlflow.log_figure(fig_mba, "sweep/threshold_sweep.png")
+    mlflow.log_text(mba_table.to_csv(index=False), "sweep/results_table.csv")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5.4 What to share back (step 4.4)
+
+# COMMAND ----------
+
+top_items = (
+    support.join(
+        spark.table(GOLD_DIM_PRODUCT).select("stock_code", "description"), "stock_code", "left"
+    )
+    .orderBy(F.col("basket_count").desc())
+    .limit(15)
+    .collect()
+)
+mcols = [
+    "min_support",
+    "frequent_items",
+    "frequent_pairs",
+    "frequent_triples",
+    "max_itemset_size",
+    "rules",
+    "rules_lift_gt_1",
+    "median_lift",
+    "max_lift",
+    "median_confidence",
+    "same_family_pairs",
+    "seconds",
+    "error",
+]
+lines = [
+    "### 4.4 results",
+    "",
+    f"- MBA sweep run: {MBA_SWEEP_RUN_ID}",
+    f"- basket stats: {basket_stats}",
+]
+lines += [
+    f"- {r['market']}: {r['baskets']:,} baskets, mean {r['mean_items']:.1f} items"
+    for r in by_market.collect()
+]
+lines += [f"- products with support >= {t}: {n:,}" for t, n in above.items()]
+lines += ["", "**Top 15 items by support**"] + [
+    f"- {r['stock_code']} {r['description']}: {r['basket_count']:,} baskets ({r['support']:.4f})"
+    for r in top_items
+]
+lines += ["", "| " + " | ".join(mcols) + " |", "|---" * len(mcols) + "|"]
+for r in mba_sweep:
+    lines.append("| " + " | ".join(fmt(r.get(c)) for c in mcols) + " |")
+stopped = [r.get("stopped_sweep") for r in mba_sweep if r.get("stopped_sweep")]
+lines.append(f"- stopped early: {stopped or 'no'}")
 print("\n".join(lines))
