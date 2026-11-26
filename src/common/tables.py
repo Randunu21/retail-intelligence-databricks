@@ -67,6 +67,20 @@ GOLD_PRODUCT_ASSOCIATIONS = fq("gold", "product_associations")
 PRODUCT_EXPERIMENT_NAME = "retail_product_intelligence"
 
 
+# Repeat-purchase propensity model (Phase 5) ---------------------------------------------
+# Training set: one row per (customer_id, cutoff_date). Features use activity strictly before
+# the cutoff, the label is "bought again in [cutoff, cutoff + 90 days)". `split` says whether
+# a cutoff is used for training, validation or the held-out test.
+ML_PROPENSITY_TRAINING_SET = fq("ml", "propensity_training_set")
+# Registered model in the Unity Catalog model registry (three-level name, like a table).
+ML_PROPENSITY_MODEL = fq("ml", "repeat_purchase_model")
+# Throw-away model used only by the Free Edition probe (registered, loaded, then deleted).
+ML_PROPENSITY_PROBE_MODEL = fq("ml", "propensity_probe_model")
+PROPENSITY_EXPERIMENT_NAME = "retail_propensity_model"
+CHAMPION_ALIAS = "champion"
+CHALLENGER_ALIAS = "challenger"
+
+
 # Benchmarks (Phase 2) -----------------------------------------------------------------
 # A separate scratch schema keeps experiment tables out of the production layers: every
 # benchmark copy can be dropped with one `DROP SCHEMA retail.bench CASCADE` at the end.
