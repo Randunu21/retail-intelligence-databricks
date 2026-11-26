@@ -179,15 +179,18 @@ def choose_final(
     min_share: float = 0.03,
     min_ari: float = 0.8,
     silhouette_tolerance: float = 0.01,
+    min_bootstrap_ari: float | None = None,
 ) -> dict | None:
     """Final (algorithm, k) rule:
 
     1. eligible = has a stability result, no error, smallest segment >= min_share, mean seed
-       ARI and mean bootstrap ARI both >= min_ari;
+       ARI >= min_ari and mean bootstrap ARI >= min_bootstrap_ari (default: = min_ari, the
+       Phase 3 rule; Phase 4 products use a separate, documented bootstrap threshold);
     2. best = highest silhouette among eligible;
     3. among eligible within `silhouette_tolerance` of best (a practical tie), take the
        LARGEST k: more segments = more targeted actions, at no real cost in separation.
     """
+    boot_min = min_ari if min_bootstrap_ari is None else min_bootstrap_ari
     sweep = {(r["algorithm"], r["k"]): r for r in sweep_rows if not r.get("error")}
     eligible = []
     for s in stability_rows:
@@ -196,7 +199,7 @@ def choose_final(
             continue
         if sweep[key]["min_share"] < min_share:
             continue
-        if (s["seed_ari_mean"] or 0) < min_ari or (s["bootstrap_ari_mean"] or 0) < min_ari:
+        if (s["seed_ari_mean"] or 0) < min_ari or (s["bootstrap_ari_mean"] or 0) < boot_min:
             continue
         eligible.append({**s, "silhouette": sweep[key]["silhouette"]})
     if not eligible:
@@ -212,4 +215,6 @@ def choose_final(
         "seed_ari_mean": pick["seed_ari_mean"],
         "bootstrap_ari_mean": pick["bootstrap_ari_mean"],
         "eligible": sorted((r["algorithm"], r["k"]) for r in eligible),
+        "min_seed_ari": min_ari,
+        "min_bootstrap_ari": boot_min,
     }

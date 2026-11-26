@@ -167,3 +167,22 @@ def test_choose_final_drops_unstable_small_and_failed():
     pick = choose_final(sweep, stab)
     assert (pick["algorithm"], pick["k"]) == ("kmeans", 3)
     assert choose_final(sweep, [_stab("kmeans", 4, 0.6, 0.9)]) is None
+
+
+def test_choose_final_separate_bootstrap_threshold():
+    """Phase 4: seed ARI must still be >= 0.8, bootstrap only >= 0.7."""
+    sweep = [
+        _sweep("bisecting_kmeans", 3, 0.364),
+        _sweep("kmeans", 3, 0.354),
+        _sweep("kmeans", 5, 0.40),
+    ]
+    stab = [
+        _stab("bisecting_kmeans", 3, 0.997, 0.744),
+        _stab("kmeans", 3, 0.981, 0.743),
+        _stab("kmeans", 5, 0.62, 0.75),  # seeds unstable: still out
+    ]
+    assert choose_final(sweep, stab) is None  # the original single 0.8 rule
+    pick = choose_final(sweep, stab, min_bootstrap_ari=0.7)
+    assert (pick["algorithm"], pick["k"]) == ("bisecting_kmeans", 3)
+    assert pick["eligible"] == [("bisecting_kmeans", 3), ("kmeans", 3)]
+    assert (pick["min_seed_ari"], pick["min_bootstrap_ari"]) == (0.8, 0.7)
