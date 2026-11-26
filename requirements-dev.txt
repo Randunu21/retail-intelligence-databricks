@@ -15,8 +15,9 @@ openpyxl>=3.1
 pyarrow>=17
 
 # Phase 5 (propensity model): same major/minor lines as Databricks serverless env 6
-# (probe 2026-11-26: scikit-learn 1.7.2, lightgbm 4.7.0, matplotlib 3.10.6).
+# (probe 2026-11-26: scikit-learn 1.7.2, lightgbm 4.7.0, matplotlib 3.10.6, optuna 5.1.0).
 # macOS: LightGBM needs OpenMP -> `brew install libomp` once before `pip install`.
 scikit-learn>=1.7,<1.8
 lightgbm>=4.7,<4.8
 matplotlib>=3.10,<3.11
+optuna>=5.1,<5.2

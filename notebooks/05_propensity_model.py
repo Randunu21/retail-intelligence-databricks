@@ -646,8 +646,8 @@ print({k: round(v, 4) for k, v in rule_val["metrics"].items() if k not in ("n", 
 
 # COMMAND ----------
 
-RUN_LOGREG = True
-LOGREG_RUN_ID = None  # paste after the first run
+RUN_LOGREG = False
+LOGREG_RUN_ID = "61fa2f8d58d14004982813d1c2a45264"  # recorded 2026-11-26 (C = 0.01)
 
 if RUN_LOGREG:
     from mlflow.models import infer_signature
@@ -763,4 +763,210 @@ lines += [
 ]
 lines += ["", "| calib. bin | mean predicted | observed |", "|---:|---:|---:|"]
 lines += [f"| {c['bin']} | {c['mean_predicted']:.3f} | {c['observed_rate']:.3f} |" for c in logreg["calibration_validation"]]
+print("\n".join(lines))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4. LightGBM tuned with Optuna (step 5.3)
+# MAGIC
+# MAGIC ### 4.0 Why trees next, and how they're tuned *(interview point)*
+# MAGIC
+# MAGIC Logistic regression adds one straight-line effect per (logged) feature. Repeat buying has
+# MAGIC **thresholds and interactions**: "≥ 2 orders in the last 90 days" is a step, and
+# MAGIC recency means something different for a one-order customer than for a loyal one.
+# MAGIC Gradient-boosted trees learn those without hand-made features, need no scaling or
+# MAGIC logs, and handle NULLs natively (the one-day customers' missing interval).
+# MAGIC
+# MAGIC Protocol (`modeling.lgbm`):
+# MAGIC
+# MAGIC | Piece | Choice | Why |
+# MAGIC |---|---|---|
+# MAGIC | sampler | Optuna **TPE**, seed 42, 40 trials (20 min cap) | Bayesian: new trials are proposed near good ones; fixed seed = repeatable study |
+# MAGIC | search space | learning rate, leaves, min samples per leaf, row/feature bagging, L1/L2 | complexity vs evidence; `min_child_samples` up to 500 because one customer appears in up to 13 snapshots |
+# MAGIC | trees | early stopping on **validation log loss** (patience 100, max 3,000) | log loss is smooth, so the stopping point is stable |
+# MAGIC | objective | **validation PR-AUC** | same selection metric as the baseline |
+# MAGIC | imbalance | none (`is_unbalance` off) | 45 % positives; reweighting would distort probabilities (3.0) |
+# MAGIC | final model | refit with exactly `best_iteration` trees, checked to reproduce the trial | the saved model has no eval set attached; `deterministic=True` + 4 fixed threads |
+# MAGIC
+# MAGIC **Validation is used for selection by both models** (C grid, trials, number of trees),
+# MAGIC so validation scores are slightly optimistic for both; the **test cutoff, used once in
+# MAGIC 5.4, is the honest comparison**. Alternatives: an inner time split inside the training
+# MAGIC cutoffs for early stopping (cleaner, but drops the most recent training months), or
+# MAGIC time-series cross-validation over several cutoffs (more robust, ~k× the compute).
+# MAGIC Pruning of bad trials (`LightGBMPruningCallback`) isn't used: it needs the separate
+# MAGIC `optuna-integration` package and each trial only takes seconds.
+
+# COMMAND ----------
+
+from modeling.lgbm import (
+    EARLY_STOPPING_ROUNDS,
+    MAX_ROUNDS,
+    N_THREADS,
+    SEED,
+    feature_importance,
+    plot_trials,
+    refit_final,
+    trials_frame,
+    tune,
+)
+from modeling.lgbm import positive_proba as lgbm_proba
+
+N_TRIALS = 40
+TUNING_TIMEOUT_S = 20 * 60
+
+RUN_LGBM = True
+LGBM_RUN_ID = None  # paste after the first run
+
+if RUN_LGBM:
+    import lightgbm as lgb
+    from mlflow.models import infer_signature
+
+    mlflow.set_experiment(EXPERIMENT_PATH)
+    with mlflow.start_run(run_name="lgbm_optuna") as parent:
+        mlflow.set_tags(
+            {
+                "phase": "5",
+                "kind": "model",
+                "model_type": "lightgbm",
+                "tuner": "optuna_tpe",
+                "training_set_run_id": TRAINING_SET_RUN_ID,
+                "selection_metric": "validation_pr_auc",
+            }
+        )
+
+        def log_trial(number, r):
+            with mlflow.start_run(run_name=f"lgbm_trial_{number:03d}", nested=True):
+                mlflow.set_tags({"phase": "5", "kind": "lgbm_trial"})
+                mlflow.log_params({**r.params, "best_iteration": r.best_iteration})
+                mlflow.log_metrics(
+                    {**prefixed(r.train, "train"), **prefixed(r.validation, "validation"), "fit_seconds": r.fit_seconds}
+                )
+            print(f"trial {number:3d}: val PR-AUC {r.validation['pr_auc']:.4f}, {r.best_iteration} trees, {r.fit_seconds} s")
+
+        t0 = time.perf_counter()
+        study = tune(train.X, train.y, val.X, val.y, n_trials=N_TRIALS, timeout=TUNING_TIMEOUT_S, seed=SEED, on_trial=log_trial)
+        tuning_seconds = round(time.perf_counter() - t0, 1)
+        trials = trials_frame(study)
+        best_params = dict(study.best_params)
+        best_iteration = int(study.best_trial.user_attrs["best_iteration"])
+
+        # Final model = best trial's parameters + its number of trees, refitted without an eval set.
+        model = refit_final(best_params, best_iteration, train.X, train.y)
+        p_train, p_val = lgbm_proba(model, train.X), lgbm_proba(model, val.X)
+        ev_train, ev_val = evaluate(train.y, p_train), evaluate(val.y, p_val)
+        refit_gap = abs(ev_val["metrics"]["pr_auc"] - study.best_value)
+        assert refit_gap < 1e-6, f"refit doesn't reproduce the best trial (diff {refit_gap})"
+
+        example = train.X.dropna().head(5)
+        signature = infer_signature(example, model.predict_proba(example))
+        info = mlflow.sklearn.log_model(
+            model,
+            name="model",
+            signature=signature,
+            input_example=example,
+            pyfunc_predict_fn="predict_proba",
+            extra_pip_requirements=[f"lightgbm=={lgb.__version__}"],
+        )
+
+        mlflow.log_params(
+            {
+                **best_params,
+                "n_estimators": best_iteration,
+                "n_trials": len(trials),
+                "max_rounds": MAX_ROUNDS,
+                "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
+                "seed": SEED,
+                "n_threads": N_THREADS,
+                "class_weight": "none",
+            }
+        )
+        mlflow.log_metrics(
+            {
+                **prefixed(ev_train["metrics"], "train"),
+                **prefixed(ev_val["metrics"], "validation"),
+                "tuning_seconds": tuning_seconds,
+                "refit_gap": refit_gap,
+            }
+        )
+
+        logreg_model = mlflow.sklearn.load_model(LOGREG_MODEL_URI)
+        p_val_lr = positive_proba(logreg_model, val.X)
+        importance = feature_importance(model, "gain")
+        mlflow.log_dict(
+            {
+                "model_uri": info.model_uri,
+                "best_params": best_params,
+                "best_iteration": best_iteration,
+                "train": ev_train["metrics"],
+                "validation": ev_val["metrics"],
+                "trials": json.loads(trials.to_json(orient="records")),
+                "importance_gain": importance.round(6).to_dict(),
+                "gain_validation": json.loads(ev_val["gain"].to_json(orient="records")),
+                "calibration_validation": json.loads(ev_val["calibration"].to_json(orient="records")),
+                "tuning_seconds": tuning_seconds,
+            },
+            "evaluation/lgbm.json",
+        )
+        scores = {
+            "lightgbm": (val.y, p_val),
+            "logreg": (val.y, p_val_lr),
+            "recency rule": (val.y, recency_rule_scores(val.X)),
+        }
+        figs = {
+            "optuna_history": plot_trials(trials, baseline_value=logreg["validation"]["pr_auc"]),
+            "roc_pr_validation": plot_roc_pr(scores, "Validation (cutoff 2011-06-13)"),
+            "gain_validation": plot_gain(scores, title="Cumulative gain (validation)"),
+            "lift_validation": plot_lift(scores, title="Lift by decile (validation)"),
+            "calibration_validation": plot_calibration(
+                {"lightgbm": (val.y, p_val), "logreg": (val.y, p_val_lr)}, title="Calibration (validation)"
+            ),
+            "importance_gain": plot_bars(importance, "LightGBM: share of total split gain", "share of gain"),
+        }
+        for name, fig in figs.items():
+            mlflow.log_figure(fig, f"plots/{name}.png")
+        LGBM_RUN_ID = parent.info.run_id
+
+lgbm = mlflow.artifacts.load_dict(f"runs:/{LGBM_RUN_ID}/evaluation/lgbm.json")
+LGBM_MODEL_URI = lgbm["model_uri"]
+print("lgbm run:", LGBM_RUN_ID, "| model:", LGBM_MODEL_URI)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.1 Results to paste into the chat
+# MAGIC
+# MAGIC What to look at: the train–validation gap (overfitting; but remember train pools 13
+# MAGIC cutoffs with different base rates, so it isn't a like-for-like comparison), the gain over
+# MAGIC the baseline on PR-AUC and top-20 % capture, calibration (trees are often less
+# MAGIC calibrated than logistic regression), and whether the best trial sits at the edge of
+# MAGIC the search space (then the range should widen).
+
+# COMMAND ----------
+
+lines = ["### Phase 5.3 results", "", f"- lgbm run: {LGBM_RUN_ID}, model: {LGBM_MODEL_URI}"]
+lines += [f"- trials: {len(lgbm['trials'])}, tuning {lgbm['tuning_seconds']} s; best trees: {lgbm['best_iteration']}"]
+lines += ["- best params: " + ", ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in lgbm["best_params"].items())]
+lines += ["", "| model / split | " + " | ".join(KEYS) + " |", "|---|" + "---:|" * len(KEYS)]
+lines += [f"| lgbm train | {_fmt(lgbm['train'])} |", f"| lgbm validation | {_fmt(lgbm['validation'])} |"]
+lines += [f"| logreg validation | {_fmt(logreg['validation'])} |", f"| recency rule validation | {_fmt(logreg['rule_validation'])} |"]
+d = {k: lgbm["validation"][k] - logreg["validation"][k] for k in ("pr_auc", "roc_auc", "brier", "capture_top_20pct", "ece")}
+lines += ["- lgbm − logreg (validation): " + ", ".join(f"{k} {v:+.4f}" for k, v in d.items())]
+tr = sorted(lgbm["trials"], key=lambda t: -t["value"])
+lines += ["", "| trial | val PR-AUC | val ROC-AUC | trees | lr | leaves | min_child | subsample | colsample | lambda | alpha |", "|---:|" + "---:|" * 10]
+lines += [
+    f"| {t['trial']} | {t['value']:.4f} | {t['validation_roc_auc']:.4f} | {t['best_iteration']} | {t['learning_rate']:.4f} | {t['num_leaves']} | {t['min_child_samples']} | {t['subsample']:.2f} | {t['colsample_bytree']:.2f} | {t['reg_lambda']:.3g} | {t['reg_alpha']:.3g} |"
+    for t in tr[:5]
+]
+vals = [t["value"] for t in lgbm["trials"]]
+lines += [f"- trial PR-AUC range: {min(vals):.4f} .. {max(vals):.4f} (median {sorted(vals)[len(vals) // 2]:.4f})"]
+top = list(lgbm["importance_gain"].items())[:10]
+lines += ["- importance (gain share): " + ", ".join(f"{k} {v:.3f}" for k, v in top)]
+lines += ["", "| band | customers | positives | rate | lift | cum. share of buyers |", "|---:|---:|---:|---:|---:|---:|"]
+lines += [
+    f"| {g['band']} | {g['customers']:,} | {g['positives']:,} | {g['rate']:.3f} | {g['lift']:.2f} | {g['cum_positive_share']:.3f} |"
+    for g in lgbm["gain_validation"]
+]
+lines += ["", "| calib. bin | mean predicted | observed |", "|---:|---:|---:|"]
+lines += [f"| {c['bin']} | {c['mean_predicted']:.3f} | {c['observed_rate']:.3f} |" for c in lgbm["calibration_validation"]]
 print("\n".join(lines))
