@@ -1,4 +1,4 @@
-"""MLflow logging for segmentation runs (Phase 3).
+"""MLflow logging for segmentation runs (Phase 3 customers, Phase 4 products).
 
 Layout in the experiment:
 - one parent run per sweep (`k_sweep`), holding the comparison plots and all results as JSON,
@@ -35,14 +35,16 @@ def trial_run_name(r: TrialResult) -> str:
     return f"{r.algorithm}_k{r.k}"
 
 
-def log_trial(r: TrialResult, common_params: Mapping[str, object]) -> str:
-    """Log one trial as a nested run under the active parent run. Returns its run id."""
+def log_trial(r: TrialResult, common_params: Mapping[str, object], phase: str = "3") -> str:
+    """Log one trial as a nested run under the active parent run. Returns its run id.
+
+    `phase` is the MLflow tag ("3" customers, "4" products)."""
     import mlflow
 
     with mlflow.start_run(run_name=trial_run_name(r), nested=True) as run:
         mlflow.set_tags(
             {
-                "phase": "3",
+                "phase": phase,
                 "kind": "sweep_trial",
                 "algorithm": r.algorithm,
                 "implementation": r.implementation,

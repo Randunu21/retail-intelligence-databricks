@@ -15,7 +15,7 @@
 # MAGIC |---|---|---|
 # MAGIC | 1 | **Free Edition probe**: Spark ML KMeans + **FPGrowth** on serverless, MLflow experiment | 4.1 |
 # MAGIC | 2 | **Product feature table** `retail.ml.product_features` + long-tail analysis | 4.1 |
-# MAGIC | 3 | Preprocessing, clustering sweep, stability (coming in 4.2) | 4.2 |
+# MAGIC | 3 | **Product clustering**: long-tail rule, preprocessing, KMeans / bisecting / GMM sweep, stability, final choice | 4.2 |
 # MAGIC | 4 | Final model, profiles, names, `retail.gold.product_segments` (4.3) | 4.3 |
 # MAGIC | 5 | Baskets and frequent itemsets (4.4) | 4.4 |
 # MAGIC | 6 | Association rules, `retail.gold.product_associations` (4.5) | 4.5 |
@@ -119,6 +119,11 @@ print("MLflow experiment:", EXPERIMENT_PATH)
 # MAGIC
 # MAGIC KMeans is re-checked too (it worked in Phase 3; one line keeps this notebook
 # MAGIC self-contained).
+# MAGIC
+# MAGIC **Result (2026-11-25):** all four FPGrowth calls **ok** on serverless (Spark 4.2.0,
+# MAGIC environment 6), contrary to the docs. So section 5 uses Spark ML `FPGrowth` directly. We
+# MAGIC never *save* the fitted model (persistence is the part most likely to be blocked, as
+# MAGIC with BisectingKMeans in Phase 3): itemsets and rules are written to Delta instead.
 
 # COMMAND ----------
 
@@ -454,4 +459,509 @@ lines += ["", "**Long tail**"] + [
     f"- n_invoices >= {r['min_invoices']}: {r['products']:,} products ({r['product_share']:.1%}), {r['revenue_share']:.1%} of revenue"
     for r in tail
 ]
+print("\n".join(lines))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 3. Product clustering
+# MAGIC
+# MAGIC Same method as customer segmentation (Phase 3), reused unchanged from
+# MAGIC `src/segmentation/` with `stock_code` as the id: preprocessing → sweep of three
+# MAGIC algorithms over k = 2..10 → stability → pre-stated choice rule. What's new for products
+# MAGIC is in `src/segmentation/product_segments.py`: who is clustered, and on which features.
+# MAGIC
+# MAGIC ### 3.1 The long tail: who gets clustered?
+# MAGIC
+# MAGIC From 2.6: the top 1,030 products (22 %) make 80 % of revenue, and the 978 products with
+# MAGIC fewer than 20 invoices make only 1.7 %. For a product with a handful of orders, every
+# MAGIC share-type feature jumps with each single order (one Q4 order out of 4 = 25 % "seasonal"),
+# MAGIC so its features are mostly noise. Rule (stated before clustering):
+# MAGIC
+# MAGIC | class | condition | segment |
+# MAGIC |---|---|---|
+# MAGIC | `new_product` | fewer than 3 months on sale (checked first) | rule: **New Products** |
+# MAGIC | `low_volume` | fewer than **20** invoices | rule: **Long Tail** |
+# MAGIC | `clustered` | the rest (~3.7k products, ~98 % of revenue) | from the model |
+# MAGIC
+# MAGIC Why 20: it keeps 79 % of products and 98.3 % of revenue (4.1 table); at 10 we'd add 392
+# MAGIC products for 0.5 % of revenue, at 50 we'd lose 2.4 % of revenue and 775 more products.
+# MAGIC Every product still gets a segment in Gold; only the *method* differs.
+
+# COMMAND ----------
+
+import pandas as pd
+
+from segmentation.clustering import ALGORITHMS, run_sweep
+from segmentation.metrics import elbow_k, suggest_k
+from segmentation.plots import ari_bars, correlation_heatmap, metric_by_k, share_bars
+from segmentation.preprocessing import (
+    CLIP_QUANTILES,
+    CORRELATION_THRESHOLD,
+    SKEW_THRESHOLD,
+    apply_preprocessor,
+    choose_log_features,
+    clip_counts,
+    correlation_matrix,
+    fit_preprocessor,
+    log_transform,
+    prune_correlated,
+    scaled_name,
+)
+from segmentation.product_segments import (
+    CLUSTERED,
+    DEFAULT_CANDIDATES_PER_ALGORITHM,
+    ELIGIBILITY_COL,
+    MIN_INVOICES,
+    MIN_MONTHS,
+    PRODUCT_CANDIDATE_FEATURES,
+    PRODUCT_PROFILE_ONLY_FEATURES,
+    add_eligibility,
+    eligibility_summary,
+    stability_candidates,
+)
+from segmentation.stability import choose_final, stability
+from segmentation.tracking import log_trial, results_table
+
+with_eligibility = add_eligibility(product_feats, MIN_INVOICES, MIN_MONTHS)
+eligibility = eligibility_summary(with_eligibility)
+for r in eligibility:
+    print(
+        f"{r['eligibility']:12s} {r['products']:5,d} products ({r['product_share']:6.1%}), "
+        f"{r['revenue_share']:6.1%} of revenue"
+    )
+eligible = with_eligibility.where(F.col(ELIGIBILITY_COL) == CLUSTERED)
+N_CLUSTERED = next(r["products"] for r in eligibility if r["eligibility"] == CLUSTERED)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.2 Which features, and which get a log?
+# MAGIC
+# MAGIC **Clustering candidates** (priority order: velocity and price first, the two axes a
+# MAGIC merchandiser thinks in; then seasonality, lumpiness, lifecycle, international appeal,
+# MAGIC regularity, reach). **Profile-only** features (printed below) stay in the table and
+# MAGIC describe the segments, but would only repeat information or carve a trivial split. Same
+# MAGIC idea as Phase 3's basket value: `log(revenue) ≈ log(price) + log(velocity) + log(weeks)`,
+# MAGIC so revenue adds no new direction to the distance; it's the *result* of the segment, which
+# MAGIC is exactly what we want to read in the profiles.
+# MAGIC
+# MAGIC Log rule as in Phase 3: raw skewness > 1, now measured on the **eligible** products only
+# MAGIC (the long tail is excluded, so the distributions change).
+
+# COMMAND ----------
+
+for feature, reason in PRODUCT_PROFILE_ONLY_FEATURES.items():
+    print(f"profile only  {feature:24s} {reason}")
+
+raw_dist = describe_features(eligible, PRODUCT_CANDIDATE_FEATURES).toPandas()
+raw_skew = dict(zip(raw_dist["feature"], raw_dist["skewness"], strict=True))
+LOG_CANDIDATES = choose_log_features(raw_skew, PRODUCT_CANDIDATE_FEATURES, SKEW_THRESHOLD)
+print("\nraw skewness:", {k: round(v, 3) for k, v in raw_skew.items()})
+print("log1p applied to:", LOG_CANDIDATES)
+display(raw_dist)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.3 Correlation check and pruning
+# MAGIC
+# MAGIC On the transformed scale (what KMeans sees). In priority order, a feature is dropped if
+# MAGIC |r| > 0.9 with one already kept. Expected suspects: `unique_customers` vs velocity (more
+# MAGIC buyers = more units) and `active_week_share` vs `monthly_units_cv` (a product that sells
+# MAGIC every week has smooth months). The rule decides, not us.
+
+# COMMAND ----------
+
+logged = log_transform(eligible.select("stock_code", *PRODUCT_CANDIDATE_FEATURES), LOG_CANDIDATES)
+corr = correlation_matrix(logged, PRODUCT_CANDIDATE_FEATURES)
+CLUSTER_FEATURES, dropped = prune_correlated(
+    PRODUCT_CANDIDATE_FEATURES, corr, CORRELATION_THRESHOLD
+)
+LOG_FEATURES = [f for f in LOG_CANDIDATES if f in CLUSTER_FEATURES]
+print("clustering features:", CLUSTER_FEATURES)
+print("log features      :", LOG_FEATURES)
+print("dropped           :", {k: (v[0], round(v[1], 3)) for k, v in dropped.items()})
+corr_fig = correlation_heatmap(
+    corr, PRODUCT_CANDIDATE_FEATURES, "Product features: correlation (log1p where skewed)"
+)
+display(corr_fig)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.4 Fit clipping + scaling, apply, log to MLflow
+# MAGIC
+# MAGIC Clip to [p1, p99] after the log (keeps extreme products like the 80,995-unit one-line
+# MAGIC order from dragging a centroid, without dropping them), then standardise. Parameters are
+# MAGIC JSON, logged with the run and re-applied at scoring time without refitting.
+
+# COMMAND ----------
+
+pp = fit_preprocessor(eligible, CLUSTER_FEATURES, LOG_FEATURES, CLIP_QUANTILES)
+clipped = clip_counts(eligible, pp)
+for f in CLUSTER_FEATURES:
+    print(
+        f"{f:24s} log={f in LOG_FEATURES!s:5s} bounds=[{pp.lower[f]:.3f}, {pp.upper[f]:.3f}] "
+        f"mean={pp.mean[f]:.3f} sd={pp.std[f]:.3f} clipped low/high={clipped[f]}"
+    )
+
+prepared = apply_preprocessor(eligible, pp, keep=["stock_code"])
+Z_COLS = [scaled_name(f) for f in CLUSTER_FEATURES]
+z_check = prepared.agg(
+    *[F.mean(c).alias(f"mean_{c}") for c in Z_COLS], *[F.stddev(c).alias(f"sd_{c}") for c in Z_COLS]
+).first()
+for c in Z_COLS:
+    assert abs(z_check[f"mean_{c}"]) < 1e-6 and abs(z_check[f"sd_{c}"] - 1) < 1e-6, c
+print("all scaled features have mean 0, sd 1")
+
+mlflow.set_experiment(EXPERIMENT_PATH)
+with mlflow.start_run(run_name="product_preprocessing") as pp_run:
+    mlflow.set_tags({"phase": "4", "kind": "preprocessing", "feature_table": ML_PRODUCT_FEATURES})
+    mlflow.log_params(
+        {
+            "as_of_date": str(AS_OF),
+            "n_products": checks["products"],
+            "n_clustered": N_CLUSTERED,
+            "min_invoices": MIN_INVOICES,
+            "min_months": MIN_MONTHS,
+            "cluster_features": ",".join(CLUSTER_FEATURES),
+            "log_features": ",".join(LOG_FEATURES),
+            "skew_threshold": SKEW_THRESHOLD,
+            "correlation_threshold": CORRELATION_THRESHOLD,
+            "clip_quantiles": f"{CLIP_QUANTILES[0]},{CLIP_QUANTILES[1]}",
+            "dropped_correlated": ",".join(dropped) or "none",
+        }
+    )
+    mlflow.log_dict(pp.to_dict(), "preprocessing/params.json")
+    mlflow.log_dict(
+        {f"{a}|{b}": r for (a, b), r in corr.items() if a < b}, "preprocessing/correlation.json"
+    )
+    mlflow.log_dict({k: list(v) for k, v in clipped.items()}, "preprocessing/clip_counts.json")
+    mlflow.log_dict({"eligibility": eligibility}, "preprocessing/eligibility.json")
+    mlflow.log_dict(PRODUCT_PROFILE_ONLY_FEATURES, "preprocessing/profile_only_features.json")
+    mlflow.log_figure(corr_fig, "preprocessing/correlation_heatmap.png")
+PREPROCESS_RUN_ID = pp_run.info.run_id
+print("preprocessing run:", PREPROCESS_RUN_ID)
+
+prepared = prepared.cache()  # reused by every fit below (df.cache() works on serverless)
+print("prepared rows:", prepared.count())
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.5 Sweep: KMeans, bisecting k-means, GMM for k = 2..10
+# MAGIC
+# MAGIC Identical to Phase 3 section 4 (one parent MLflow run, one nested run per algorithm × k;
+# MAGIC bisecting k-means = the KMeans-splits implementation, since Spark's `BisectingKMeans`
+# MAGIC fails on Free Edition with `DBFS_DISABLED`). k rules: silhouette main, WCSS elbow as a
+# MAGIC cross-check, smallest segment ≥ 3 % of clustered products (~110), k ≥ 3.
+# MAGIC
+# MAGIC After the first run, set `RUN_SWEEP = False` and paste the run id: results are then
+# MAGIC reloaded from MLflow.
+
+# COMMAND ----------
+
+KS = list(range(2, 11))
+SEED = 42
+MIN_SHARE = 0.03
+K_MIN = 3
+BISECTING_IMPL = "kmeans_splits"  # Phase 3 probe: Spark BisectingKMeans -> DBFS_DISABLED
+
+RUN_SWEEP = True
+SWEEP_RUN_ID = ""  # paste after the first run, then RUN_SWEEP = False
+
+common_params = {
+    "as_of_date": str(AS_OF),
+    "cluster_features": ",".join(CLUSTER_FEATURES),
+    "preprocess_run_id": PREPROCESS_RUN_ID,
+    "n_products": N_CLUSTERED,
+}
+
+
+def log_and_print(r):
+    log_trial(r, common_params, phase="4")
+    sil = r.metrics.get("silhouette")
+    print(
+        f"{r.algorithm:17s} k={r.k:2d} silhouette={sil if sil is None else round(sil, 4)} "
+        f"min_share={round(r.metrics.get('min_share', 0), 4)} error={r.error}"
+    )
+
+
+if RUN_SWEEP:
+    mlflow.set_experiment(EXPERIMENT_PATH)
+    with mlflow.start_run(run_name="product_k_sweep") as sweep_run:
+        mlflow.set_tags({"phase": "4", "kind": "k_sweep", "bisecting_impl": BISECTING_IMPL})
+        mlflow.log_params(
+            {
+                **common_params,
+                "ks": f"{KS[0]}-{KS[-1]}",
+                "seed": SEED,
+                "min_share": MIN_SHARE,
+                "k_min": K_MIN,
+            }
+        )
+        trials = run_sweep(
+            prepared,
+            Z_COLS,
+            KS,
+            ALGORITHMS,
+            seed=SEED,
+            bisecting_impl=BISECTING_IMPL,
+            on_result=log_and_print,
+        )
+        sweep_results = [t.to_dict() for t in trials]
+        mlflow.log_dict({"results": sweep_results}, "sweep/results.json")
+    SWEEP_RUN_ID = sweep_run.info.run_id
+else:
+    sweep_results = mlflow.artifacts.load_dict(f"runs:/{SWEEP_RUN_ID}/sweep/results.json")[
+        "results"
+    ]
+print("sweep run:", SWEEP_RUN_ID, "| trials:", len(sweep_results))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.6 Compare: silhouette, elbow, segment sizes
+
+# COMMAND ----------
+
+rows = results_table(sweep_results)
+table = pd.DataFrame(rows).sort_values(["algorithm", "k"])
+display(table)
+
+suggested = {a: suggest_k(sweep_results, a, MIN_SHARE, K_MIN) for a in ALGORITHMS}
+elbows = {}
+for a in ALGORITHMS:
+    ok = sorted((r["k"], r["wcss"]) for r in rows if r["algorithm"] == a and not r["error"])
+    elbows[a] = elbow_k([k for k, _ in ok], [w for _, w in ok]) if ok else None
+print("silhouette-best k (min share, k>=3):", suggested)
+print("WCSS elbow k                       :", elbows)
+
+fig_sil = metric_by_k(
+    rows,
+    "silhouette",
+    "silhouette (squared Euclidean)",
+    "Products: silhouette by k (circled = suggested k)",
+    marks=suggested,
+)
+fig_wcss = metric_by_k(
+    rows, "wcss", "WCSS", "Products: within-cluster sum of squares by k", marks=elbows
+)
+fig_min = metric_by_k(
+    rows, "min_share", "smallest segment share", "Products: smallest segment by k"
+)
+for fig in (fig_sil, fig_wcss, fig_min):
+    display(fig)
+
+size_figs = {}
+for a, k in suggested.items():
+    if k is None:
+        continue
+    trial = next(r for r in sweep_results if r["algorithm"] == a and r["k"] == k)
+    size_figs[a] = share_bars(
+        dict(sorted({int(c): v for c, v in trial["shares"].items()}.items())),
+        f"{a}, k={k}: segment sizes",
+    )
+    display(size_figs[a])
+
+with mlflow.start_run(run_id=SWEEP_RUN_ID):
+    mlflow.log_figure(fig_sil, "sweep/silhouette_by_k.png")
+    mlflow.log_figure(fig_wcss, "sweep/elbow_wcss_by_k.png")
+    mlflow.log_figure(fig_min, "sweep/min_share_by_k.png")
+    for a, fig in size_figs.items():
+        mlflow.log_figure(fig, f"sweep/segment_sizes_{a}_k{suggested[a]}.png")
+    mlflow.log_dict({"suggested_k": suggested, "elbow_k": elbows}, "sweep/suggestions.json")
+    mlflow.log_text(table.to_csv(index=False), "sweep/results_table.csv")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.7 Stability of the candidates
+# MAGIC
+# MAGIC Same tests as Phase 3 (5 seeds → 10 pair ARIs; 5 bootstrap refits labelling all products,
+# MAGIC ARI vs the reference fit). **Candidates come from a rule fixed before seeing the sweep**
+# MAGIC (`stability_candidates`): per algorithm the top k by silhouette among eligible k
+# MAGIC (KMeans 4, bisecting 2, GMM 1). In Phase 3 the candidates were picked by reading the
+# MAGIC sweep; a rule removes that judgement call.
+
+# COMMAND ----------
+
+STABILITY_SEEDS = (SEED, 1, 2, 3, 4)
+BOOTSTRAP_SEEDS = (101, 102, 103, 104, 105)
+MIN_ARI = 0.8
+SIL_TOLERANCE = 0.01
+STABILITY_CANDIDATES = stability_candidates(
+    sweep_results, DEFAULT_CANDIDATES_PER_ALGORITHM, MIN_SHARE, K_MIN
+)
+print("stability candidates:", STABILITY_CANDIDATES)
+
+RUN_STABILITY = True
+STABILITY_RUN_ID = ""  # paste after the first run, then RUN_STABILITY = False
+
+if RUN_STABILITY:
+    mlflow.set_experiment(EXPERIMENT_PATH)
+    stability_results = []
+    with mlflow.start_run(run_name="product_stability") as stab_run:
+        mlflow.set_tags({"phase": "4", "kind": "stability", "sweep_run_id": SWEEP_RUN_ID})
+        mlflow.log_params(
+            {
+                **common_params,
+                "seeds": ",".join(map(str, STABILITY_SEEDS)),
+                "bootstrap_seeds": ",".join(map(str, BOOTSTRAP_SEEDS)),
+                "min_ari": MIN_ARI,
+                "candidates": ",".join(f"{a}:{k}" for a, k in STABILITY_CANDIDATES),
+            }
+        )
+        for algo, k in STABILITY_CANDIDATES:
+            res = stability(
+                algo, prepared, k, Z_COLS, STABILITY_SEEDS, BOOTSTRAP_SEEDS, id_col="stock_code"
+            )
+            d = res.to_dict()
+            stability_results.append(d)
+            with mlflow.start_run(run_name=f"stability_{algo}_k{k}", nested=True):
+                mlflow.set_tags(
+                    {
+                        "phase": "4",
+                        "kind": "stability_trial",
+                        "algorithm": algo,
+                        "status": "failed" if res.error else "ok",
+                    }
+                )
+                mlflow.log_params({"algorithm": algo, "k": k})
+                mlflow.log_metrics({m: v for m, v in res.summary().items() if v is not None})
+                mlflow.log_dict(d, "stability/result.json")
+            print(f"{algo:17s} k={k} {res.summary()} error={res.error}")
+        mlflow.log_dict({"results": stability_results}, "stability/results.json")
+    STABILITY_RUN_ID = stab_run.info.run_id
+else:
+    stability_results = mlflow.artifacts.load_dict(
+        f"runs:/{STABILITY_RUN_ID}/stability/results.json"
+    )["results"]
+print("stability run:", STABILITY_RUN_ID)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.8 The final choice
+# MAGIC
+# MAGIC Same rule as Phase 3 (`choose_final`): stable (mean seed and bootstrap ARI ≥ 0.8),
+# MAGIC smallest segment ≥ 3 %, then best silhouette; within 0.01 of the best, the larger k.
+
+# COMMAND ----------
+
+
+def _sil(algorithm, k):
+    return next(x["silhouette"] for x in rows if (x["algorithm"], x["k"]) == (algorithm, k))
+
+
+stab_table = pd.DataFrame(
+    [
+        {
+            "algorithm": r["algorithm"],
+            "k": r["k"],
+            "silhouette": _sil(r["algorithm"], r["k"]),
+            **{
+                m: r[m]
+                for m in [
+                    "seed_ari_mean",
+                    "seed_ari_min",
+                    "bootstrap_ari_mean",
+                    "bootstrap_ari_min",
+                ]
+            },
+            "error": r["error"],
+        }
+        for r in stability_results
+    ]
+)
+display(stab_table)
+fig_ari = ari_bars(stability_results, MIN_ARI, "Products: stability (adjusted Rand index)")
+display(fig_ari)
+
+FINAL = choose_final(rows, stability_results, MIN_SHARE, MIN_ARI, SIL_TOLERANCE)
+print("final choice:", FINAL)
+assert FINAL is not None, "no candidate passed: share the output before going on"
+
+with mlflow.start_run(run_id=STABILITY_RUN_ID):
+    mlflow.log_figure(fig_ari, "stability/ari_by_candidate.png")
+    mlflow.log_text(stab_table.to_csv(index=False), "stability/results_table.csv")
+    mlflow.log_dict(FINAL, "stability/final_choice.json")
+    mlflow.set_tags({"final_algorithm": FINAL["algorithm"], "final_k": str(FINAL["k"])})
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.9 What to share back (step 4.2)
+
+# COMMAND ----------
+
+cols = [
+    "silhouette",
+    "wcss",
+    "min_share",
+    "max_share",
+    "n_empty_clusters",
+    "mean_max_probability",
+    "fit_eval_seconds",
+]
+scols = ["silhouette", "seed_ari_mean", "seed_ari_min", "bootstrap_ari_mean", "bootstrap_ari_min"]
+
+
+def fmt(v):
+    if v is None or (isinstance(v, float) and v != v):  # None or NaN
+        return ""
+    return f"{v:.4f}" if isinstance(v, float) else str(v)
+
+
+lines = ["### 4.2 results", "", "**Eligibility**"]
+lines += [
+    f"- {r['eligibility']}: {r['products']:,} products ({r['product_share']:.1%}), {r['revenue_share']:.1%} of revenue"
+    for r in eligibility
+]
+lines += [
+    "",
+    f"- raw skewness (eligible): { {k: round(v, 3) for k, v in raw_skew.items()} }",
+    f"- log features: {LOG_FEATURES}",
+    f"- clustering features: {CLUSTER_FEATURES}",
+    f"- dropped: { {k: (v[0], round(v[1], 3)) for k, v in dropped.items()} }",
+    f"- clipped (low, high): {clipped}",
+    f"- runs: preprocessing {PREPROCESS_RUN_ID}, sweep {SWEEP_RUN_ID}, stability {STABILITY_RUN_ID}",
+    "",
+    "| | " + " | ".join(PRODUCT_CANDIDATE_FEATURES) + " |",
+    "|---" * (len(PRODUCT_CANDIDATE_FEATURES) + 1) + "|",
+]
+for a in PRODUCT_CANDIDATE_FEATURES:
+    lines.append(
+        f"| {a} | " + " | ".join(f"{corr[(a, b)]:.3f}" for b in PRODUCT_CANDIDATE_FEATURES) + " |"
+    )
+lines += [
+    "",
+    f"- suggested k: {suggested}",
+    f"- elbow k: {elbows}",
+    f"- errors: {[(r['algorithm'], r['k'], r['error']) for r in rows if r['error']] or 'none'}",
+]
+lines += ["", "| algorithm | k | " + " | ".join(cols) + " |", "|---|---|" + "---|" * len(cols)]
+for r in sorted(rows, key=lambda r: (r["algorithm"], r["k"])):
+    lines.append(
+        f"| {r['algorithm']} | {r['k']} | " + " | ".join(fmt(r.get(c)) for c in cols) + " |"
+    )
+lines += [
+    "",
+    f"- stability candidates: {STABILITY_CANDIDATES}",
+    "",
+    "| algorithm | k | " + " | ".join(scols) + " | error |",
+    "|---|---|" + "---|" * (len(scols) + 1),
+]
+for r in stab_table.to_dict("records"):
+    lines.append(
+        f"| {r['algorithm']} | {r['k']} | "
+        + " | ".join(fmt(r[c]) for c in scols)
+        + f" | {r['error'] or ''} |"
+    )
+lines += ["", f"- **final choice**: {FINAL}"]
+final_trial = next(
+    r for r in sweep_results if r["algorithm"] == FINAL["algorithm"] and r["k"] == FINAL["k"]
+)
+lines.append(f"- final shares: { {c: round(v, 4) for c, v in final_trial['shares'].items()} }")
 print("\n".join(lines))
