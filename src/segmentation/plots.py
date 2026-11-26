@@ -146,18 +146,20 @@ def centroid_heatmap(centers, features, segment_labels, title: str):
     return fig
 
 
-def group_share_bars(rows, title: str):
-    """Horizontal bars per action group: share of customers vs share of revenue.
-    rows = dicts with action_group, customer_share, revenue_share (in display order)."""
+def group_share_bars(
+    rows, title: str, share_key: str = "customer_share", entity: str = "customers"
+):
+    """Horizontal bars per action group: share of customers (or products) vs share of revenue.
+    rows = dicts with action_group, `share_key`, revenue_share (in display order)."""
     import matplotlib.pyplot as plt
 
     labels = [r["action_group"] for r in rows][::-1]
-    cust = [100 * r["customer_share"] for r in rows][::-1]
+    cust = [100 * r[share_key] for r in rows][::-1]
     rev = [100 * r["revenue_share"] for r in rows][::-1]
     y = list(range(len(rows)))
     h = 0.4
     fig, ax = plt.subplots(figsize=(9, 0.55 * len(rows) + 1.5))
-    b1 = ax.barh([i + h / 2 for i in y], cust, h, label="% of customers", color="#4C72B0")
+    b1 = ax.barh([i + h / 2 for i in y], cust, h, label=f"% of {entity}", color="#4C72B0")
     b2 = ax.barh([i - h / 2 for i in y], rev, h, label="% of revenue", color="#DD8452")
     ax.bar_label(b1, labels=[f"{v:.1f}%" for v in cust], fontsize=8, padding=2)
     ax.bar_label(b2, labels=[f"{v:.1f}%" for v in rev], fontsize=8, padding=2)

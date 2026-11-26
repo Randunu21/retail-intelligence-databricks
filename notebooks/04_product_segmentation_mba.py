@@ -16,7 +16,7 @@
 # MAGIC | 1 | **Free Edition probe**: Spark ML KMeans + **FPGrowth** on serverless, MLflow experiment | 4.1 |
 # MAGIC | 2 | **Product feature table** `retail.ml.product_features` + long-tail analysis | 4.1 |
 # MAGIC | 3 | **Product clustering**: long-tail rule, preprocessing, KMeans / bisecting / GMM sweep, stability, final choice | 4.2 |
-# MAGIC | 4 | **Final model and profiles** (4.3a); names + `retail.gold.product_segments` (4.3b) | 4.3 |
+# MAGIC | 4 | **Final model, profiles, names, action groups**, `retail.gold.product_segments` | 4.3 |
 # MAGIC | 5 | Baskets and frequent itemsets (4.4) | 4.4 |
 # MAGIC | 6 | Association rules, `retail.gold.product_associations` (4.5) | 4.5 |
 # MAGIC | 7 | Generated `docs/product_insights.md` (4.6) | 4.6 |
@@ -1153,8 +1153,8 @@ display(examples)
 
 # COMMAND ----------
 
-RUN_LOG_FINAL = True
-FINAL_RUN_ID = ""  # paste after the first run, then RUN_LOG_FINAL = False
+RUN_LOG_FINAL = False
+FINAL_RUN_ID = "47f3364bfad44e05862b9f8dd8f35999"  # recorded 2026-11-26
 
 if RUN_LOG_FINAL:
     mlflow.set_experiment(EXPERIMENT_PATH)
@@ -1299,5 +1299,215 @@ for label, grp in examples.groupby(SEGMENT_LABEL_COL, sort=True):
             f"price {r['median_unit_price']:.2f}, Q4 {r['seasonal_revenue_share']:.2f}, last sale {r['days_since_last_sale']} d ago)"
             for r in grp.to_dict("records")
         )
+    )
+print("\n".join(lines))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.7 Names from the profiles (4.3b)
+# MAGIC
+# MAGIC What the 4.3a numbers say (shares of the whole catalogue of 4,725 products):
+# MAGIC
+# MAGIC | Segment | Evidence (medians unless noted) | Products / revenue |
+# MAGIC |---|---|---|
+# MAGIC | 0 **Core Fast Movers** | 34 units/week, sells in 91 % of weeks, 151 customers, last sale 2 days ago (96 % in the last 30 days); top items = Regency cakestand, white hanging heart T-light holder, jumbo bags | 43 % / **87 %** |
+# MAGIC | 1 **Fading Lines** | last sale 331 days ago (75 % unsold for 180+ days), sells in 26 % of weeks, lumpiest months (CV 2.1), 90 % already on sale in Dec 2009 | 20 % / 7 % |
+# MAGIC | 2 **Slow Movers** | still selling (85 % in the last 30 days) but 2.5 units/week and 28 customers; highest prices (median £2.95, mean £5.55) and most UK-centric; furniture, cabinets, advent calendars | 16 % / 4 % |
+# MAGIC | Long Tail (rule) | < 20 invoices: median 8 invoices, 65 % unsold for 180+ days | 20 % / 0.8 % |
+# MAGIC | New Products (rule) | < 3 months on sale; all Q4 2011 launches | 0.7 % / 0.9 % |
+# MAGIC
+# MAGIC **The hypothesised "seasonal" and "premium" segments did not appear as clusters.** At
+# MAGIC k = 3 the products separate on **velocity and lifecycle**; Q4-heavy products exist in every
+# MAGIC cluster (25 % of Core, 23 % of Slow Movers), and price only tilts the Slow Movers. So
+# MAGIC seasonality and premium price become **rule-based flags inside segments** (same design
+# MAGIC as the Phase 3 action groups), not invented clusters.
+# MAGIC
+# MAGIC Names are attached by **signature** on the centres (Core = highest velocity, Fading =
+# MAGIC highest days since last sale, Slow = lowest velocity); a future snapshot whose profiles no
+# MAGIC longer match raises `NamingError` instead of silently reusing names.
+# MAGIC
+# MAGIC Data check for 4.4: `23843 PAPER CRAFT, LITTLE BIRDIE` (New Products) has 80,995
+# MAGIC units/week from a single sales line: one bulk order, which drives the New Products mean
+# MAGIC velocity (2,389/week). 4.9 prints its return figures to see whether that order was
+# MAGIC cancelled (it would then also carry `is_high_return`).
+
+# COMMAND ----------
+
+from segmentation.plots import group_share_bars
+from segmentation.product_naming import (
+    DISCONTINUED_DAYS,
+    HIGH_RETURN_RATE,
+    PREMIUM_QUANTILE,
+    PRODUCT_ACTION_PLAYBOOK,
+    SEASONAL_SHARE_MIN,
+    add_product_groups,
+    group_profile,
+    name_product_segments,
+    premium_price_threshold,
+)
+from segmentation.product_outputs import (
+    build_product_segments_output,
+    product_segments_ddl,
+    write_product_segments,
+)
+from common.tables import GOLD_PRODUCT_SEGMENTS
+
+names = name_product_segments(final_model.leaf_centers, CLUSTER_FEATURES)
+for sid, d in sorted(names.items()):
+    print(f"segment {sid}: {d.name:18s} ({d.signature_feature} {d.direction})  {d.description}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.8 Action groups (rules inside the segments)
+# MAGIC
+# MAGIC | Flag | Rule | Why |
+# MAGIC |---|---|---|
+# MAGIC | `is_seasonal` | Q4 share of revenue > 0.5 | a flat product is ~0.25 in this data (Dec 2009 + two Q4s in 25 months), so > 0.5 = twice the baseline |
+# MAGIC | `is_discontinued` | no sale for > 180 days | half a year without a single order |
+# MAGIC | `is_premium` | median price ≥ p90 of clustered products (computed below) | top 10 % of the price range |
+# MAGIC | `is_high_return` | return rate ≥ 10 % | quality / description check (a column, not a group) |
+# MAGIC
+# MAGIC Groups: Core → *Seasonal Best-Sellers* / *Year-round Staples*; Fading → *Discontinued* /
+# MAGIC *Declining*; Slow → *Premium Niche* (checked first) / *Seasonal* / *Low Demand*; plus
+# MAGIC Long Tail and New Products. Each group has one recommended action and a KPI
+# MAGIC (`PRODUCT_ACTION_PLAYBOOK`).
+
+# COMMAND ----------
+
+PREMIUM_MIN = premium_price_threshold(eligible, PREMIUM_QUANTILE)
+print(
+    f"premium threshold (p{int(PREMIUM_QUANTILE * 100)} median price, clustered): GBP {PREMIUM_MIN:.2f}"
+)
+
+grouped = add_product_groups(labelled, names, PREMIUM_MIN).cache()
+groups = group_profile(grouped)
+group_table = pd.DataFrame(groups)
+display(group_table)
+fig_groups = group_share_bars(
+    groups,
+    "Product action groups: share of products vs revenue",
+    share_key="product_share",
+    entity="products",
+)
+display(fig_groups)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.9 Write `retail.gold.product_segments` and check it
+# MAGIC
+# MAGIC Every product of the snapshot (clustered + rule-based) once, with its segment, action
+# MAGIC group, recommended action, key features, flags and `model_run_id` = the final model run.
+
+# COMMAND ----------
+
+spark.sql(product_segments_ddl(GOLD_PRODUCT_SEGMENTS))
+out = build_product_segments_output(grouped, spark.table(GOLD_DIM_PRODUCT), FINAL_RUN_ID)
+write_product_segments(out, GOLD_PRODUCT_SEGMENTS, AS_OF)
+
+gold = spark.table(GOLD_PRODUCT_SEGMENTS).where(snapshot_predicate(AS_OF))
+gold_checks = (
+    gold.agg(
+        F.count(F.lit(1)).alias("rows"),
+        F.countDistinct("stock_code").alias("products"),
+        F.sum(F.col("segment_name").isNull().cast("int")).alias("null_names"),
+        F.sum(F.col("action_group").isNull().cast("int")).alias("null_groups"),
+        F.sum(F.col("description").isNull().cast("int")).alias("null_descriptions"),
+        F.sum(
+            ((F.col("segment_id").isNull()) != (F.col("cluster_eligibility") != "clustered")).cast(
+                "int"
+            )
+        ).alias("bad_segment_ids"),
+        F.countDistinct("model_run_id").alias("model_runs"),
+        F.sum("revenue").alias("revenue"),
+    )
+    .first()
+    .asDict()
+)
+print(gold_checks)
+seg_counts = {r["segment_name"]: r["count"] for r in gold.groupBy("segment_name").count().collect()}
+print("products per segment:", seg_counts)
+assert gold_checks["rows"] == gold_checks["products"] == checks["products"]
+assert gold_checks["null_names"] == 0 and gold_checks["null_groups"] == 0
+assert gold_checks["bad_segment_ids"] == 0 and gold_checks["model_runs"] == 1
+for sid, d in names.items():
+    assert seg_counts[d.name] == final_model.leaf_sizes[sid], d.name
+print("gold.product_segments checks passed")
+
+outlier = (
+    gold.where(F.col("stock_code") == "23843")
+    .join(
+        spark.table(ML_PRODUCT_FEATURES)
+        .where(snapshot_predicate(AS_OF))
+        .select("stock_code", "units_sold", "units_returned", "n_lines"),
+        "stock_code",
+    )
+    .select(
+        "stock_code",
+        "description",
+        "segment_name",
+        "units_sold",
+        "units_returned",
+        "n_lines",
+        "return_rate",
+        "is_high_return",
+        "revenue",
+    )
+    .collect()
+)
+OUTLIER_23843 = outlier[0].asDict() if outlier else None
+print("23843 check:", OUTLIER_23843)
+
+with mlflow.start_run(run_id=FINAL_RUN_ID):
+    mlflow.log_dict(
+        {
+            str(k): {
+                "key": d.key,
+                "name": d.name,
+                "signature": f"{d.signature_feature} {d.direction}",
+            }
+            for k, d in names.items()
+        },
+        "naming/segment_names.json",
+    )
+    mlflow.log_dict(
+        {
+            "seasonal_share_min": SEASONAL_SHARE_MIN,
+            "discontinued_days": DISCONTINUED_DAYS,
+            "premium_quantile": PREMIUM_QUANTILE,
+            "premium_min_price": PREMIUM_MIN,
+            "high_return_rate": HIGH_RETURN_RATE,
+            "playbook": PRODUCT_ACTION_PLAYBOOK,
+        },
+        "naming/action_rules.json",
+    )
+    mlflow.log_text(group_table.to_csv(index=False), "naming/action_groups.csv")
+    mlflow.log_figure(fig_groups, "naming/action_groups.png")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.10 What to share back (step 4.3b)
+
+# COMMAND ----------
+
+lines = [
+    "### 4.3b results",
+    "",
+    f"- names: { {sid: d.name for sid, d in sorted(names.items())} }",
+    f"- premium threshold: GBP {PREMIUM_MIN:.2f}",
+    f"- gold checks: {gold_checks}",
+    f"- products per segment: {seg_counts}",
+    f"- 23843 check: {OUTLIER_23843}",
+    "",
+    "| segment | action group | products | product share | revenue share | median units/wk | median price | median days since sale | median Q4 share | % high return |",
+    "|---|---|---|---|---|---|---|---|---|---|",
+]
+for g in groups:
+    lines.append(
+        f"| {g['segment_name']} | {g['action_group']} | {g['products']:,} | {g['product_share']:.3f} | {g['revenue_share']:.3f} | "
+        f"{fmt(g['median_units_per_week'])} | {fmt(g['median_price'])} | {g['median_days_since_last_sale']} | {fmt(g['median_q4_share'])} | {fmt(g['pct_high_return'])} |"
     )
 print("\n".join(lines))
