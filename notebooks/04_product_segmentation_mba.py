@@ -16,7 +16,7 @@
 # MAGIC | 1 | **Free Edition probe**: Spark ML KMeans + **FPGrowth** on serverless, MLflow experiment | 4.1 |
 # MAGIC | 2 | **Product feature table** `retail.ml.product_features` + long-tail analysis | 4.1 |
 # MAGIC | 3 | **Product clustering**: long-tail rule, preprocessing, KMeans / bisecting / GMM sweep, stability, final choice | 4.2 |
-# MAGIC | 4 | Final model, profiles, names, `retail.gold.product_segments` (4.3) | 4.3 |
+# MAGIC | 4 | **Final model and profiles** (4.3a); names + `retail.gold.product_segments` (4.3b) | 4.3 |
 # MAGIC | 5 | Baskets and frequent itemsets (4.4) | 4.4 |
 # MAGIC | 6 | Association rules, `retail.gold.product_associations` (4.5) | 4.5 |
 # MAGIC | 7 | Generated `docs/product_insights.md` (4.6) | 4.6 |
@@ -669,7 +669,7 @@ K_MIN = 3
 BISECTING_IMPL = "kmeans_splits"  # Phase 3 probe: Spark BisectingKMeans -> DBFS_DISABLED
 
 RUN_SWEEP = False
-SWEEP_RUN_ID = "b37d8caeac6c4d9ea0f13c38321a0c5c"  # paste after the first run, then RUN_SWEEP = False
+SWEEP_RUN_ID = "b37d8caeac6c4d9ea0f13c38321a0c5c"  # recorded 2026-11-26
 
 common_params = {
     "as_of_date": str(AS_OF),
@@ -797,7 +797,7 @@ STABILITY_CANDIDATES = stability_candidates(
 print("stability candidates:", STABILITY_CANDIDATES)
 
 RUN_STABILITY = False
-STABILITY_RUN_ID = "7fdee340c9ef45d0a2e634f14ada3224"  # paste after the first run, then RUN_STABILITY = False
+STABILITY_RUN_ID = "7fdee340c9ef45d0a2e634f14ada3224"  # recorded 2026-11-26
 
 if RUN_STABILITY:
     mlflow.set_experiment(EXPERIMENT_PATH)
@@ -1022,4 +1022,282 @@ final_trial = next(
     r for r in sweep_results if r["algorithm"] == FINAL["algorithm"] and r["k"] == FINAL["k"]
 )
 lines.append(f"- final shares: { {c: round(v, 4) for c, v in final_trial['shares'].items()} }")
+print("\n".join(lines))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4. Final model and product segment profiles
+# MAGIC
+# MAGIC ### 4.1 Rebuild the evaluated model (no refit) and prove it is the same model
+# MAGIC
+# MAGIC The final model is **the recorded sweep trial** (Phase 3 rule: refits aren't
+# MAGIC bit-reproducible on serverless). For bisecting k-means the recorded model is the split
+# MAGIC sequence; scoring replays it (`src/segmentation/product_model.py`). Segment ids are
+# MAGIC re-ordered by the velocity centre: **segment 0 = fastest-selling group**.
+# MAGIC
+# MAGIC Proof that it's the evaluated model: same silhouette (to 1e-6) and same segment sizes as
+# MAGIC the sweep trial chosen in 3.8.
+
+# COMMAND ----------
+
+from segmentation.plots import centroid_heatmap
+from segmentation.product_model import (
+    PRODUCT_PROFILE_FEATURES,
+    SEGMENT_COL,
+    SEGMENT_LABEL_COL,
+    label_all_products,
+    product_model_from_trial,
+    product_segment_profile,
+    top_products,
+)
+from segmentation.metrics import silhouette
+from segmentation.stability import ari_between
+
+final_model = product_model_from_trial(
+    sweep_results, FINAL["algorithm"], FINAL["k"], pp, prepared, seed=SEED
+)
+segmented = final_model.assign_prepared(prepared).cache()
+
+final_sil = silhouette(segmented, "features", SEGMENT_COL)
+trial = next(
+    r for r in sweep_results if r["algorithm"] == FINAL["algorithm"] and r["k"] == FINAL["k"]
+)
+trial_sizes = sorted(round(v * N_CLUSTERED) for v in trial["shares"].values())
+print(f"silhouette: rebuilt {final_sil:.6f} vs sweep {FINAL['silhouette']:.6f}")
+print(
+    "segment sizes (by segment id):",
+    final_model.leaf_sizes,
+    "| id map raw->segment:",
+    final_model.id_map,
+)
+assert abs(final_sil - FINAL["silhouette"]) < 1e-6, "rebuilt model differs from the evaluated trial"
+assert sorted(final_model.leaf_sizes) == trial_sizes, "segment sizes differ from the trial"
+print("rebuilt model == evaluated sweep trial")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.2 Agreement with KMeans k = 3
+# MAGIC
+# MAGIC KMeans k = 3 also passed the revised rule (silhouette 0.354, within the 0.01 tie of
+# MAGIC bisecting's 0.364). If two different algorithms find nearly the same three groups, the
+# MAGIC structure is a property of the data, not of one algorithm: a useful extra argument given
+# MAGIC the bootstrap ARI of 0.74. ARI between the two final labelings, and the cross-tab.
+
+# COMMAND ----------
+
+kmeans3 = product_model_from_trial(sweep_results, "kmeans", 3, pp, prepared, seed=SEED)
+km_labels = kmeans3.assign_prepared(prepared).select(
+    "stock_code", F.col(SEGMENT_COL).alias("kmeans_k3")
+)
+agreement = segmented.select("stock_code", SEGMENT_COL).join(km_labels, "stock_code")
+pairs = agreement.collect()
+ARI_VS_KMEANS = ari_between(
+    {r["stock_code"]: r[SEGMENT_COL] for r in pairs},
+    {r["stock_code"]: r["kmeans_k3"] for r in pairs},
+)
+crosstab = agreement.groupBy(SEGMENT_COL).pivot("kmeans_k3").count().orderBy(SEGMENT_COL).toPandas()
+print(f"ARI(bisecting k=3, KMeans k=3) = {ARI_VS_KMEANS:.4f}")
+display(crosstab)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.3 Profiles: the 3 clusters and the 2 rule-based groups
+# MAGIC
+# MAGIC Every product of the catalogue is in exactly one row below: `cluster 0..2` from the model,
+# MAGIC `low_volume` and `new_product` from the long-tail rule (3.1). Shares are of the **whole**
+# MAGIC catalogue. Read with the centroid heatmap (cluster centres in standard deviations from
+# MAGIC the average clustered product, after log/clip) and the example products in 4.4.
+# MAGIC Names are given in 4.3b **from these numbers**, not before.
+
+# COMMAND ----------
+
+labelled = label_all_products(with_eligibility, segmented)
+profile = product_segment_profile(labelled, PRODUCT_PROFILE_FEATURES).toPandas()
+display(profile)
+
+heat_fig = centroid_heatmap(
+    final_model.leaf_centers,
+    CLUSTER_FEATURES,
+    [f"segment {i} (n={n})" for i, n in enumerate(final_model.leaf_sizes)],
+    f"Product segments: {FINAL['algorithm']} k={FINAL['k']} centres (z)",
+)
+display(heat_fig)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.4 Example products per segment
+# MAGIC
+# MAGIC The 10 biggest products by revenue in each group, with descriptions from
+# MAGIC `gold.dim_product`. A "seasonal" segment should show Christmas items; a "staples" segment
+# MAGIC should show everyday best-sellers. If the examples contradict the numbers, the profile
+# MAGIC is wrong, not the examples.
+
+# COMMAND ----------
+
+examples = top_products(labelled, spark.table(GOLD_DIM_PRODUCT), n=10).toPandas()
+display(examples)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.5 Log the final model to MLflow
+# MAGIC
+# MAGIC One run `product_final_<algorithm>_k<k>` with the model JSON (preprocessing params +
+# MAGIC splits + id map + leaf centres), the profile, examples, agreement and the heatmap. Its
+# MAGIC run id becomes `model_run_id` in `gold.product_segments` (4.3b). Set
+# MAGIC `RUN_LOG_FINAL = False` and paste the id after the first run.
+
+# COMMAND ----------
+
+RUN_LOG_FINAL = True
+FINAL_RUN_ID = ""  # paste after the first run, then RUN_LOG_FINAL = False
+
+if RUN_LOG_FINAL:
+    mlflow.set_experiment(EXPERIMENT_PATH)
+    with mlflow.start_run(
+        run_name=f"product_final_{FINAL['algorithm']}_k{FINAL['k']}"
+    ) as final_run:
+        mlflow.set_tags(
+            {
+                "phase": "4",
+                "kind": "final_model",
+                "algorithm": FINAL["algorithm"],
+                "preprocess_run_id": PREPROCESS_RUN_ID,
+                "sweep_run_id": SWEEP_RUN_ID,
+                "stability_run_id": STABILITY_RUN_ID,
+                "rule_deviation": str(DECISION["deviation"]),
+            }
+        )
+        mlflow.log_params(
+            {
+                "as_of_date": str(AS_OF),
+                "k": FINAL["k"],
+                "seed": SEED,
+                "cluster_features": ",".join(CLUSTER_FEATURES),
+                "order_by": final_model.order_by,
+                "n_clustered": N_CLUSTERED,
+                "min_invoices": MIN_INVOICES,
+                "min_months": MIN_MONTHS,
+            }
+        )
+        mlflow.log_metrics({"silhouette": final_sil, "ari_vs_kmeans_k3": ARI_VS_KMEANS})
+        mlflow.log_dict(final_model.to_dict(), "model/product_segment_model.json")
+        mlflow.log_dict(DECISION, "model/selection_decision.json")
+        mlflow.log_text(profile.to_csv(index=False), "profiles/segment_profile.csv")
+        mlflow.log_text(examples.to_csv(index=False), "profiles/top_products.csv")
+        mlflow.log_text(crosstab.to_csv(index=False), "profiles/crosstab_vs_kmeans_k3.csv")
+        mlflow.log_figure(heat_fig, "profiles/centroid_heatmap.png")
+    FINAL_RUN_ID = final_run.info.run_id
+print("final model run:", FINAL_RUN_ID)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.6 What to share back (step 4.3a)
+
+# COMMAND ----------
+
+key_medians = [
+    "revenue",
+    "n_invoices",
+    "units_per_week",
+    "active_week_share",
+    "median_unit_price",
+    "unique_customers",
+    "non_uk_revenue_share",
+    "seasonal_revenue_share",
+    "monthly_units_cv",
+    "return_rate",
+    "days_since_last_sale",
+    "days_on_sale",
+    "avg_quantity_per_line",
+]
+pct_cols = [
+    "pct_sold_last_30d",
+    "pct_not_sold_180d",
+    "pct_q4_majority",
+    "pct_international",
+    "pct_price_10_plus",
+    "pct_return_rate_5_plus",
+    "pct_history_censored",
+]
+lines = [
+    "### 4.3a results",
+    "",
+    f"- final model run: {FINAL_RUN_ID}",
+    f"- silhouette rebuilt {final_sil:.6f} (sweep {FINAL['silhouette']:.6f}); sizes {final_model.leaf_sizes}; id map {final_model.id_map}",
+    f"- ARI vs KMeans k=3: {ARI_VS_KMEANS:.4f}",
+    "",
+    "**Cross-tab (rows = bisecting segment, columns = KMeans k=3)**",
+    "",
+    "| " + " | ".join(map(str, crosstab.columns)) + " |",
+    "|---" * len(crosstab.columns) + "|",
+    *["| " + " | ".join(fmt(v) for v in row) + " |" for row in crosstab.itertuples(index=False)],
+    "",
+    "**Size and value**",
+    "",
+    "| label | products | product share | revenue | revenue share | revenue/product |",
+    "|---|---|---|---|---|---|",
+]
+for r in profile.to_dict("records"):
+    lines.append(
+        f"| {r[SEGMENT_LABEL_COL]} | {r['products']:,} | {r['product_share']:.3f} | "
+        f"{r['total_revenue']:,.0f} | {r['revenue_share']:.3f} | {r['revenue_per_product']:,.0f} |"
+    )
+lines += [
+    "",
+    "**Medians**",
+    "",
+    "| label | " + " | ".join(key_medians) + " |",
+    "|---" * (len(key_medians) + 1) + "|",
+]
+for r in profile.to_dict("records"):
+    lines.append(
+        f"| {r[SEGMENT_LABEL_COL]} | "
+        + " | ".join(fmt(r[f"median_{c}"]) for c in key_medians)
+        + " |"
+    )
+lines += [
+    "",
+    "**Means (selected)**",
+    "",
+    "| label | " + " | ".join(key_medians) + " |",
+    "|---" * (len(key_medians) + 1) + "|",
+]
+for r in profile.to_dict("records"):
+    lines.append(
+        f"| {r[SEGMENT_LABEL_COL]} | " + " | ".join(fmt(r[f"mean_{c}"]) for c in key_medians) + " |"
+    )
+lines += [
+    "",
+    "**Shares of products**",
+    "",
+    "| label | " + " | ".join(pct_cols) + " |",
+    "|---" * (len(pct_cols) + 1) + "|",
+]
+for r in profile.to_dict("records"):
+    lines.append(f"| {r[SEGMENT_LABEL_COL]} | " + " | ".join(fmt(r[c]) for c in pct_cols) + " |")
+lines += [
+    "",
+    "**Centres (z)**",
+    "",
+    "| segment | " + " | ".join(CLUSTER_FEATURES) + " |",
+    "|---" * (len(CLUSTER_FEATURES) + 1) + "|",
+]
+for i, c in enumerate(final_model.leaf_centers):
+    lines.append(f"| {i} | " + " | ".join(f"{v:+.3f}" for v in c) + " |")
+lines += ["", "**Top 10 products per group**", ""]
+for label, grp in examples.groupby(SEGMENT_LABEL_COL, sort=True):
+    lines.append(
+        f"- {label}: "
+        + "; ".join(
+            f"{r['stock_code']} {r['description']} (GBP {r['revenue']:,.0f}, {r['units_per_week']:.1f}/wk, "
+            f"price {r['median_unit_price']:.2f}, Q4 {r['seasonal_revenue_share']:.2f}, last sale {r['days_since_last_sale']} d ago)"
+            for r in grp.to_dict("records")
+        )
+    )
 print("\n".join(lines))
