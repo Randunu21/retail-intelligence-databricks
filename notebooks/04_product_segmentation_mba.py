@@ -1882,7 +1882,10 @@ if RUN_MBA_RULES:
     write_associations(assoc_out, GOLD_PRODUCT_ASSOCIATIONS, AS_OF)
 print("rules run:", MBA_RULES_RUN_ID)
 
-assoc = spark.table(GOLD_PRODUCT_ASSOCIATIONS).where(snapshot_predicate(AS_OF)).cache()
+# No .cache() here: this notebook rewrites the table above, and a cached read of the same plan
+# can survive in the Spark session (even across restartPython) and return the PREVIOUS run's
+# rows. Found on 2026-11-26: the rerun's doc was built from run 37226335's cached rules.
+assoc = spark.table(GOLD_PRODUCT_ASSOCIATIONS).where(snapshot_predicate(AS_OF))
 assoc_checks = (
     assoc.agg(
         F.count(F.lit(1)).alias("rows"),
@@ -1899,6 +1902,10 @@ assoc_checks = (
 print(assoc_checks)
 assert assoc_checks["rows"] == assoc_checks["rule_ids"], "duplicate rule ids"
 assert assoc_checks["min_confidence"] >= MIN_CONFIDENCE - 1e-12 and assoc_checks["runs"] == 1
+gold_run_ids = [r[0] for r in assoc.select("mlflow_run_id").distinct().collect()]
+assert gold_run_ids == [MBA_RULES_RUN_ID], (
+    f"gold holds rules of run {gold_run_ids}, expected {MBA_RULES_RUN_ID}"
+)
 
 by_scope = (
     assoc.groupBy("scope", "rule_type")
