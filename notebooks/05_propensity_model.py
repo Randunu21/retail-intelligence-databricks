@@ -1028,7 +1028,7 @@ for name, logged in (("lightgbm", lgbm), ("logreg", logreg)):
 
 # COMMAND ----------
 
-RUN_TEST_EVAL = True
+RUN_TEST_EVAL = False  # recorded 2026-11-27 in the lgbm and logreg runs
 
 if RUN_TEST_EVAL:
     ev_test = {name: evaluate(test.y, p) for name, p in p_test.items()}
@@ -1094,7 +1094,7 @@ test_eval = mlflow.artifacts.load_dict(f"runs:/{LGBM_RUN_ID}/evaluation/test.jso
 
 # COMMAND ----------
 
-RUN_SHAP = True
+RUN_SHAP = False  # recorded 2026-11-27 (lgbm run, shap/)
 N_DEPENDENCE = 4
 
 if RUN_SHAP:
@@ -1179,4 +1179,162 @@ def _bin_text(r):
 
 for f, rows in shap_summary["dependence"].items():
     lines += ["", f"- dependence `{f}` (interaction: {shap_summary['interactions'][f]}): " + "; ".join(_bin_text(r) for r in rows)]
+print("\n".join(lines))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6. Unity Catalog model registry: champion / challenger (step 5.5)
+# MAGIC
+# MAGIC ### 6.0 Concepts and the promotion rule *(interview point)*
+# MAGIC
+# MAGIC - **Registered model** `retail.ml.repeat_purchase_model`: a Unity Catalog object (same
+# MAGIC   three-level name as a table) with grants, lineage to its training run, and versions.
+# MAGIC - **Version**: an immutable copy of one logged model (with its signature, input example
+# MAGIC   and pinned requirements). Registering needs the signature: UC rejects models without one.
+# MAGIC - **Alias**: a movable pointer, e.g. `@champion`. The Phase 6 scoring job will load
+# MAGIC   `models:/retail.ml.repeat_purchase_model@champion`; promotion or rollback = moving
+# MAGIC   the alias, with no change to the job. (Aliases replace the old Staging/Production stages.)
+# MAGIC
+# MAGIC **Promotion rule** (`modeling.promote.PromotionRule`), decided on the **validation
+# MAGIC cutoff**, with both models scored again on the same rows at decision time:
+# MAGIC
+# MAGIC | Check | Threshold | Why |
+# MAGIC |---|---|---|
+# MAGIC | PR-AUC gain | ≥ +0.005 | primary metric; a minimum practical gain |
+# MAGIC | paired-bootstrap 95 % CI of the gain | lower bound > 0 | 5.4 showed ±~0.007 noise on one snapshot: the margin alone would sit inside it |
+# MAGIC | ROC-AUC | not worse by > 0.01 | guardrail: overall ranking |
+# MAGIC | Brier | not worse by > 0.005 | guardrail: probabilities must stay usable |
+# MAGIC
+# MAGIC Flow: register the **logistic regression → version 1**; with no champion yet it becomes
+# MAGIC `@champion`. Register **LightGBM → version 2** as `@challenger`; the rule decides. If it
+# MAGIC passes, `@champion` moves to version 2 and `@challenger` is removed; if not, version 2
+# MAGIC keeps `@challenger` for inspection. Every decision is stored on the version (tags) and in
+# MAGIC an MLflow run. Registration is idempotent (a version is found again by its source run),
+# MAGIC and the rule only runs for newly registered versions, so a re-run can't demote anything.
+# MAGIC
+# MAGIC Alternatives: promote on test (then test is no longer untouched for the next model),
+# MAGIC shadow / A-B deployment (compare live outcomes before switching: better, but needs 90
+# MAGIC days of labels per comparison), or a manual approval step after the rule (common in
+# MAGIC regulated settings; easy to add in Phase 6 as a job task waiting on a tag).
+
+# COMMAND ----------
+
+from mlflow import MlflowClient
+
+from common.tables import CHAMPION_ALIAS, ML_PROPENSITY_MODEL
+from modeling.promote import (
+    PromotionRule,
+    aliases_table,
+    positive_scores,
+    promote_challenger,
+    register,
+)
+
+client = MlflowClient()
+RULE = PromotionRule()
+MODEL_DESCRIPTION = (
+    "Repeat-purchase propensity: P(customer places an order in the 90 days after the scoring "
+    "date). Input: modeling.dataset.prepare_features(training-set columns) as float64; output: "
+    "predict_proba, column 1 = P(repeat). Trained on retail.ml.propensity_training_set "
+    "(rolling monthly cutoffs, time-based split). Load with @champion."
+)
+CANDIDATES = [
+    {
+        "run_id": LOGREG_RUN_ID,
+        "model_uri": LOGREG_MODEL_URI,
+        "model_type": "logistic_regression",
+        "description": "Baseline: impute + log1p + standardise + L2 logistic regression (C = 0.01).",
+        "metrics": {"validation": logreg["validation"], "test": test_eval["metrics"]["logreg"]},
+    },
+    {
+        "run_id": LGBM_RUN_ID,
+        "model_uri": LGBM_MODEL_URI,
+        "model_type": "lightgbm",
+        "description": f"LightGBM tuned with Optuna (40 trials), {lgbm['best_iteration']} trees.",
+        "metrics": {"validation": lgbm["validation"], "test": test_eval["metrics"]["lightgbm"]},
+    },
+]
+
+RUN_REGISTRY = True
+REGISTRY_RUN_ID = None  # paste after the first run
+
+if RUN_REGISTRY:
+    mlflow.set_experiment(EXPERIMENT_PATH)
+    with mlflow.start_run(run_name="registry_promotion") as run:
+        mlflow.set_tags({"phase": "5", "kind": "registry", "model_name": ML_PROPENSITY_MODEL})
+        mlflow.log_params({f"rule_{k}": v for k, v in RULE.to_dict().items()})
+        steps = []
+        for c in CANDIDATES:
+            tags = {
+                "model_type": c["model_type"],
+                "training_set_run_id": TRAINING_SET_RUN_ID,
+                "validation_pr_auc": f"{c['metrics']['validation']['pr_auc']:.4f}",
+                "test_pr_auc": f"{c['metrics']['test']['pr_auc']:.4f}",
+                "n_features": str(len(MODEL_FEATURES)),
+            }
+            version, created = register(client, c["model_uri"], ML_PROPENSITY_MODEL, c["run_id"], tags, c["description"])
+            if version == "1" or created:
+                client.update_registered_model(ML_PROPENSITY_MODEL, description=MODEL_DESCRIPTION)
+            step = {"model_type": c["model_type"], "version": version, "created": created}
+            if created:
+                d = promote_challenger(client, ML_PROPENSITY_MODEL, version, val.X, val.y, RULE, evaluated_on="validation 2011-06-13")
+                step["decision"] = d.to_dict()
+                print(f"v{version} ({c['model_type']}): promote={d.promote} -- {d.reason}")
+                for chk in d.checks:
+                    print(f"    {'PASS' if chk['passed'] else 'FAIL'} {chk['check']}: {chk['value']:+.4f}")
+            else:
+                print(f"v{version} ({c['model_type']}) already registered: rule not re-run")
+            steps.append(step)
+        mlflow.log_dict({"rule": RULE.to_dict(), "steps": steps}, "registry/promotion.json")
+        REGISTRY_RUN_ID = run.info.run_id
+
+promotion = mlflow.artifacts.load_dict(f"runs:/{REGISTRY_RUN_ID}/registry/promotion.json")
+versions = aliases_table(client, ML_PROPENSITY_MODEL)
+display(versions)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6.1 Load the champion the way Phase 6 will
+# MAGIC
+# MAGIC Generic MLflow loader + alias, nothing model-specific: the scoring job doesn't need to
+# MAGIC know whether the champion is LightGBM or a logistic regression. Checks: the signature is
+# MAGIC stored, the champion's test scores reproduce the 5.4 metrics of the model it points to.
+
+# COMMAND ----------
+
+champion_uri = f"models:/{ML_PROPENSITY_MODEL}@{CHAMPION_ALIAS}"
+champion_mv = client.get_model_version_by_alias(ML_PROPENSITY_MODEL, CHAMPION_ALIAS)
+champion_info = mlflow.models.get_model_info(champion_uri)
+assert champion_info.signature is not None, "registered model has no signature"
+signature_inputs = [c["name"] for c in champion_info.signature.inputs.to_dict()]
+assert signature_inputs == list(MODEL_FEATURES), "signature columns differ from MODEL_FEATURES"
+
+champion = mlflow.pyfunc.load_model(champion_uri)
+p_champion = positive_scores(champion.predict(test.X))
+champion_type = client.get_model_version(ML_PROPENSITY_MODEL, champion_mv.version).tags.get("model_type")
+expected = test_eval["metrics"]["lightgbm" if champion_type == "lightgbm" else "logreg"]
+got = evaluate(test.y, p_champion)["metrics"]
+assert abs(got["pr_auc"] - expected["pr_auc"]) < 1e-9, (got["pr_auc"], expected["pr_auc"])
+print(f"@champion = version {champion_mv.version} ({champion_type}); test PR-AUC {got['pr_auc']:.4f} reproduced")
+
+# COMMAND ----------
+
+lines = ["### Phase 5.5 results", "", f"- registry run: {REGISTRY_RUN_ID}; model `{ML_PROPENSITY_MODEL}`"]
+lines += [f"- rule: {promotion['rule']}"]
+for st in promotion["steps"]:
+    d = st.get("decision")
+    head = f"- v{st['version']} {st['model_type']} (created={st['created']})"
+    if d is None:
+        lines += [head + ": already registered"]
+        continue
+    lines += [head + f": promote={d['promote']}, reason: {d['reason']}, vs champion v{d['champion_version']}"]
+    lines += [f"    - {'PASS' if c['passed'] else 'FAIL'} {c['check']}: {c['value']:+.4f}" for c in d["checks"]]
+    if d.get("bootstrap"):
+        b = d["bootstrap"]
+        lines += [f"    - bootstrap {b['metric']}: diff {b['diff']:+.4f}, 95 % CI [{b['ci_low']:+.4f}, {b['ci_high']:+.4f}], P(better) {b['p_b_better']:.3f}"]
+lines += ["", "| version | aliases | model_type | source run |", "|---:|---|---|---|"]
+lines += [f"| {r.version} | {r.aliases} | {r.model_type} | {r.source_run_id} |" for r in versions.itertuples()]
+lines += [f"- @champion = v{champion_mv.version} ({champion_type}), signature: {len(signature_inputs)} inputs, test PR-AUC reproduced {got['pr_auc']:.4f}"]
 print("\n".join(lines))
