@@ -815,8 +815,8 @@ from modeling.lgbm import positive_proba as lgbm_proba
 N_TRIALS = 40
 TUNING_TIMEOUT_S = 20 * 60
 
-RUN_LGBM = True
-LGBM_RUN_ID = None  # paste after the first run
+RUN_LGBM = False
+LGBM_RUN_ID = "96712fb7b1b64cefa6a03389fbb805c8"  # recorded 2026-11-27 (40 trials, best trial 31)
 
 if RUN_LGBM:
     import lightgbm as lgb
@@ -969,4 +969,214 @@ lines += [
 ]
 lines += ["", "| calib. bin | mean predicted | observed |", "|---:|---:|---:|"]
 lines += [f"| {c['bin']} | {c['mean_predicted']:.3f} | {c['observed_rate']:.3f} |" for c in lgbm["calibration_validation"]]
+print("\n".join(lines))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5. Held-out test evaluation and SHAP (step 5.4)
+# MAGIC
+# MAGIC ### 5.0 The test cutoff, used once
+# MAGIC
+# MAGIC Cutoff **2011-09-11**, label window to 2011-12-09: no decision so far has seen it (C,
+# MAGIC trials and tree counts were all chosen on validation). It's also the most realistic
+# MAGIC check: the latest population (5,256 customers), and a window over the **Christmas
+# MAGIC peak** (base rate 43.6 % vs 32.1 % in validation), so it tests whether the models carry
+# MAGIC over to a different season.
+# MAGIC
+# MAGIC Both models are **reloaded from their MLflow model URIs** (not the Python objects
+# MAGIC above), which also proves the logged artefacts work before they're registered in 5.5.
+# MAGIC
+# MAGIC **Is LightGBM really better?** On validation it led by ~0.01 PR-AUC. One snapshot of ~5k
+# MAGIC customers has sampling noise of the same order, so the comparison uses a **paired
+# MAGIC bootstrap** (`modeling.compare.paired_bootstrap`, 1,000 resamples of customers; both
+# MAGIC models scored on the same resample): the 95 % interval of the difference, and how often
+# MAGIC LightGBM wins. If the interval contains 0, the honest statement is "no detectable
+# MAGIC difference at this sample size". This also tells us whether the 0.005 promotion margin
+# MAGIC (5.5) is above the noise level.
+
+# COMMAND ----------
+
+from modeling.compare import paired_bootstrap
+from modeling.explain import (
+    additivity_error,
+    dependence_table,
+    direction,
+    importance,
+    lgbm_contributions,
+    plot_dependence,
+    plot_summary,
+    shap_values,
+    strongest_interaction,
+)
+
+test = split_frames(to_pandas(training_set, splits=("test",)))["test"]
+print(f"test: {test.n:,} customers, base rate {test.y.mean():.4f}")
+
+logreg_model = mlflow.sklearn.load_model(LOGREG_MODEL_URI)
+lgbm_model = mlflow.sklearn.load_model(LGBM_MODEL_URI)
+p_test = {
+    "lightgbm": lgbm_proba(lgbm_model, test.X),
+    "logreg": positive_proba(logreg_model, test.X),
+    "recency rule": recency_rule_scores(test.X),
+}
+p_val_reload = {"lightgbm": lgbm_proba(lgbm_model, val.X), "logreg": positive_proba(logreg_model, val.X)}
+# the reloaded models must reproduce the logged validation metrics
+for name, logged in (("lightgbm", lgbm), ("logreg", logreg)):
+    gap = abs(evaluate(val.y, p_val_reload[name])["metrics"]["pr_auc"] - logged["validation"]["pr_auc"])
+    assert gap < 1e-9, f"{name}: reloaded model differs from the logged one ({gap})"
+
+# COMMAND ----------
+
+RUN_TEST_EVAL = True
+
+if RUN_TEST_EVAL:
+    ev_test = {name: evaluate(test.y, p) for name, p in p_test.items()}
+    boot = {
+        f"{split}_{m}": paired_bootstrap(y, pa, pb, m, n_boot=1000, seed=SEED)
+        for split, y, pa, pb in (
+            ("test", test.y, p_test["logreg"], p_test["lightgbm"]),
+            ("validation", val.y, p_val_reload["logreg"], p_val_reload["lightgbm"]),
+        )
+        for m in ("pr_auc", "roc_auc", "brier")
+    }
+    test_scores = {name: (test.y, p) for name, p in p_test.items()}
+    test_figs = {
+        "roc_pr_test": plot_roc_pr(test_scores, "Test (cutoff 2011-09-11)"),
+        "gain_test": plot_gain(test_scores, title="Cumulative gain (test)"),
+        "lift_test": plot_lift(test_scores, title="Lift by decile (test)"),
+        "calibration_test": plot_calibration(
+            {k: test_scores[k] for k in ("lightgbm", "logreg")}, title="Calibration (test)"
+        ),
+    }
+    test_payload = {
+        "metrics": {name: ev["metrics"] for name, ev in ev_test.items()},
+        "gain": {name: json.loads(ev["gain"].to_json(orient="records")) for name, ev in ev_test.items()},
+        "calibration": {name: json.loads(ev["calibration"].to_json(orient="records")) for name, ev in ev_test.items()},
+        "bootstrap_lgbm_minus_logreg": boot,
+    }
+    with mlflow.start_run(run_id=LGBM_RUN_ID):
+        mlflow.log_metrics(prefixed(ev_test["lightgbm"]["metrics"], "test"))
+        mlflow.log_metrics(prefixed(ev_test["recency rule"]["metrics"], "rule_test"))
+        mlflow.log_metrics({f"boot_{k}_diff_ci_low": v["ci_low"] for k, v in boot.items()})
+        mlflow.log_dict(test_payload, "evaluation/test.json")
+        for name, fig in test_figs.items():
+            mlflow.log_figure(fig, f"plots/{name}.png")
+    with mlflow.start_run(run_id=LOGREG_RUN_ID):
+        mlflow.log_metrics(prefixed(ev_test["logreg"]["metrics"], "test"))
+        mlflow.log_dict({"metrics": ev_test["logreg"]["metrics"]}, "evaluation/test.json")
+        for name, fig in test_figs.items():
+            mlflow.log_figure(fig, f"plots/{name}.png")
+
+test_eval = mlflow.artifacts.load_dict(f"runs:/{LGBM_RUN_ID}/evaluation/test.json")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5.1 SHAP: what drives a repeat purchase?
+# MAGIC
+# MAGIC Computed on the **test snapshot** with the LightGBM model (the population we'd score
+# MAGIC next). Units are **log-odds**: +0.5 moves a 30 % customer to about 41 %.
+# MAGIC
+# MAGIC - **Checks first**: SHAP from the `shap` library vs LightGBM's built-in TreeSHAP
+# MAGIC   (`pred_contrib=True`) must agree, and base value + Σ SHAP must equal the raw score
+# MAGIC   for every customer (additivity).
+# MAGIC - **Summary (beeswarm)**: each dot a customer; x = effect on the score; colour = feature
+# MAGIC   value (red high). Ranked by mean |SHAP|, which differs from the split-gain importance
+# MAGIC   in 4.x: gain counts how much splits improved training loss, SHAP measures how much a
+# MAGIC   feature actually moves predictions.
+# MAGIC - **Dependence plots** for the top 4 features: the *shape* of each effect (thresholds,
+# MAGIC   saturation), coloured by its strongest interaction partner.
+# MAGIC
+# MAGIC Caveat *(interview point)*: SHAP explains the **model**, not causality. "More orders in
+# MAGIC the last 180 days → higher score" doesn't mean a promotion that buys an order causes
+# MAGIC loyalty; correlated features (orders vs revenue windows) also share credit.
+
+# COMMAND ----------
+
+RUN_SHAP = True
+N_DEPENDENCE = 4
+
+if RUN_SHAP:
+    sv, base_value = shap_values(lgbm_model, test.X)
+    contrib, contrib_base = lgbm_contributions(lgbm_model, test.X)
+    shap_checks = {
+        "max_abs_diff_shap_vs_lightgbm": float(np.max(np.abs(sv - contrib))),
+        "base_value_diff": abs(base_value - contrib_base),
+        "additivity_error": additivity_error(lgbm_model, test.X, sv, base_value),
+        "base_value_log_odds": base_value,
+        "base_value_probability": float(1 / (1 + np.exp(-base_value))),
+    }
+    assert shap_checks["max_abs_diff_shap_vs_lightgbm"] < 1e-6 and shap_checks["additivity_error"] < 1e-6
+
+    imp = importance(sv, test.X.columns)
+    dirs = direction(sv, test.X)
+    imp["direction"] = imp["feature"].map(dirs)
+    top_features = imp["feature"].head(N_DEPENDENCE).tolist()
+    interactions = {f: strongest_interaction(sv, test.X, f) for f in top_features}
+    dep_tables = {f: dependence_table(sv, test.X, f) for f in top_features}
+
+    shap_figs = {
+        "shap_summary": plot_summary(sv, test.X),
+        "shap_importance": plot_bars(imp.set_index("feature")["mean_abs_shap"], "Mean |SHAP| (test)", "mean |SHAP| (log-odds)"),
+        **{f"shap_dependence_{f}": plot_dependence(sv, test.X, f, interactions[f]) for f in top_features},
+    }
+    with mlflow.start_run(run_id=LGBM_RUN_ID):
+        mlflow.log_dict(
+            {
+                "checks": shap_checks,
+                "importance": json.loads(imp.to_json(orient="records")),
+                "interactions": interactions,
+                "dependence": {f: json.loads(t.to_json(orient="records")) for f, t in dep_tables.items()},
+            },
+            "shap/summary.json",
+        )
+        for name, fig in shap_figs.items():
+            mlflow.log_figure(fig, f"shap/{name}.png")
+    display(imp)
+
+shap_summary = mlflow.artifacts.load_dict(f"runs:/{LGBM_RUN_ID}/shap/summary.json")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5.2 Results to paste into the chat
+
+# COMMAND ----------
+
+m = test_eval["metrics"]
+lines = ["### Phase 5.4 results", "", f"- test: {test.n:,} customers, base rate {test.y.mean():.4f}"]
+lines += ["", "| model (test) | " + " | ".join(KEYS) + " |", "|---|" + "---:|" * len(KEYS)]
+lines += [f"| {name} | {_fmt(m[name])} |" for name in ("lightgbm", "logreg", "recency rule")]
+lines += ["", "| LightGBM − logreg | diff | 95 % CI | P(LightGBM better) |", "|---|---:|---|---:|"]
+lines += [
+    f"| {k} | {b['diff']:+.4f} | [{b['ci_low']:+.4f}, {b['ci_high']:+.4f}] | {b['p_b_better']:.3f} |"
+    for k, b in test_eval["bootstrap_lgbm_minus_logreg"].items()
+]
+lines += ["", "| band (test, lightgbm) | customers | positives | rate | lift | cum. share of buyers |", "|---:|---:|---:|---:|---:|---:|"]
+lines += [
+    f"| {g['band']} | {g['customers']:,} | {g['positives']:,} | {g['rate']:.3f} | {g['lift']:.2f} | {g['cum_positive_share']:.3f} |"
+    for g in test_eval["gain"]["lightgbm"]
+]
+lines += ["", "| calib. bin | lgbm predicted | lgbm observed | logreg predicted | logreg observed |", "|---:|---:|---:|---:|---:|"]
+lines += [
+    f"| {a['bin']} | {a['mean_predicted']:.3f} | {a['observed_rate']:.3f} | {b['mean_predicted']:.3f} | {b['observed_rate']:.3f} |"
+    for a, b in zip(test_eval["calibration"]["lightgbm"], test_eval["calibration"]["logreg"], strict=True)
+]
+lines += ["", f"- SHAP checks: {shap_summary['checks']}"]
+lines += ["", "| feature | mean abs SHAP | share | direction (Spearman) |", "|---|---:|---:|---:|"]
+lines += [
+    f"| {r['feature']} | {r['mean_abs_shap']:.4f} | {r['share']:.3f} | {r['direction']:+.2f} |" if r["direction"] is not None
+    else f"| {r['feature']} | {r['mean_abs_shap']:.4f} | {r['share']:.3f} | n/a |"
+    for r in shap_summary["importance"][:12]
+]
+
+
+def _bin_text(r):
+    x_range = "NULL" if r["x_min"] is None else f"{r['x_min']:.4g}-{r['x_max']:.4g}"
+    return f"{x_range} -> {r['mean_shap']:+.3f} (n={r['n']})"
+
+
+for f, rows in shap_summary["dependence"].items():
+    lines += ["", f"- dependence `{f}` (interaction: {shap_summary['interactions'][f]}): " + "; ".join(_bin_text(r) for r in rows)]
 print("\n".join(lines))
