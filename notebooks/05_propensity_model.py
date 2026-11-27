@@ -18,7 +18,7 @@
 # MAGIC | 4 | LightGBM tuned with Optuna | 5.3 |
 # MAGIC | 5 | SHAP explanations + held-out test evaluation | 5.4 |
 # MAGIC | 6 | Registry: champion / challenger + promotion rule | 5.5 |
-# MAGIC | 7 | Phase 5 checks | 5.6 |
+# MAGIC | 7 | **Phase 5 checks**: done-when criteria asserted (champion alias, charts and SHAP plots in MLflow, no-leakage proofs) | 5.6 |
 # MAGIC
 # MAGIC Logic lives in `src/modeling/` (unit-tested); this notebook runs it and explains each
 # MAGIC decision.
@@ -1256,8 +1256,8 @@ CANDIDATES = [
     },
 ]
 
-RUN_REGISTRY = True
-REGISTRY_RUN_ID = None  # paste after the first run
+RUN_REGISTRY = False  # done 2026-11-27: v1 logreg, v2 lightgbm = @champion
+REGISTRY_RUN_ID = "70baa9a4cbe3433db4cf58ab84329041"
 
 if RUN_REGISTRY:
     mlflow.set_experiment(EXPERIMENT_PATH)
@@ -1338,3 +1338,60 @@ lines += ["", "| version | aliases | model_type | source run |", "|---:|---|---|
 lines += [f"| {r.version} | {r.aliases} | {r.model_type} | {r.source_run_id} |" for r in versions.itertuples()]
 lines += [f"- @champion = v{champion_mv.version} ({champion_type}), signature: {len(signature_inputs)} inputs, test PR-AUC reproduced {got['pr_auc']:.4f}"]
 print("\n".join(lines))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 7. Phase 5 checks (step 5.6)
+# MAGIC
+# MAGIC The phase's "done when" criteria, asserted from what is stored (registry, MLflow
+# MAGIC artefacts, the training-set run), not from variables in this session. Re-runnable at any
+# MAGIC time: it only reads.
+
+# COMMAND ----------
+
+REQUIRED_ARTIFACTS = {
+    "plots": [
+        "optuna_history", "roc_pr_validation", "gain_validation", "lift_validation",
+        "calibration_validation", "importance_gain", "roc_pr_test", "gain_test", "lift_test",
+        "calibration_test",
+    ],
+    "shap": ["shap_summary", "shap_importance"],
+}
+
+
+def artifact_names(run_id, folder):
+    return {Path(f.path).stem for f in client.list_artifacts(run_id, folder)}
+
+
+phase5_checks = {}
+
+champ = client.get_model_version_by_alias(ML_PROPENSITY_MODEL, CHAMPION_ALIAS)
+champ_full = client.get_model_version(ML_PROPENSITY_MODEL, champ.version)
+phase5_checks["champion alias in UC"] = f"v{champ.version} ({champ_full.tags.get('model_type')})"
+phase5_checks["champion has signature"] = mlflow.models.get_model_info(f"models:/{ML_PROPENSITY_MODEL}@{CHAMPION_ALIAS}").signature is not None
+phase5_checks["champion decided by the rule"] = "promotion_decision" in champ_full.tags
+
+missing = {
+    folder: sorted(set(names) - artifact_names(LGBM_RUN_ID, folder))
+    for folder, names in REQUIRED_ARTIFACTS.items()
+}
+dependence_plots = [n for n in artifact_names(LGBM_RUN_ID, "shap") if n.startswith("shap_dependence_")]
+phase5_checks["evaluation charts in MLflow"] = not missing["plots"]
+phase5_checks["SHAP summary + importance in MLflow"] = not missing["shap"]
+phase5_checks["SHAP dependence plots"] = len(dependence_plots)
+phase5_checks["test metrics logged"] = "test_pr_auc" in client.get_run(LGBM_RUN_ID).data.metrics
+
+ts_run = mlflow.artifacts.load_dict(f"runs:/{TRAINING_SET_RUN_ID}/training_set/summary.json")
+phase5_checks["no-leakage proof (truncation)"] = all(
+    r["only_in_full"] == 0 and r["only_in_truncated"] == 0 for r in ts_run["leakage_checks"]
+)
+phase5_checks["feature-store PIT check"] = ts_run["pit_check"]["only_in_builder"] == 0 and ts_run["pit_check"]["only_in_feature_store"] == 0
+
+for k, v in phase5_checks.items():
+    print(f"  {k:40s} {v}")
+assert not missing["plots"] and not missing["shap"], missing
+assert phase5_checks["champion has signature"] and phase5_checks["champion decided by the rule"]
+assert phase5_checks["SHAP dependence plots"] >= 4 and phase5_checks["test metrics logged"]
+assert phase5_checks["no-leakage proof (truncation)"] and phase5_checks["feature-store PIT check"]
+print("Phase 5 done-when checks passed")
